@@ -1,7 +1,7 @@
 
 import torch
 import torch.nn as nn
-from models.BaseModel import Base
+from models.base import Base
 from argparse import Namespace
 from layers.FeatureEmbedding import FeatureEmbedding
 

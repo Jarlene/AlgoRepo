@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import einsum, nn
-from models.BaseModel import Base
+from models.base import Base
 from layers.Layers import LayerNorm, Residual, RotaryEmbedding, RelPosBias2d
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange

@@ -1,4 +1,4 @@
-from models.BaseModel import Base
+from models.base import Base
 from layers.Layers import FeaturesEmbedding, FeaturesLinear, AttentionalFactorizationMachine
 from typing import Dict
 import torch
@@ -44,8 +44,9 @@ class AFM(Base):
         if len(self.metrics) > 0:
             pred = self.forward(x)
             for k, m in self.metrics.items():
+                m.to(x.device)
                 m.update(pred, y)
-                res[m] = m.compute()
+                res[k] = m.compute()
 
         return res
 

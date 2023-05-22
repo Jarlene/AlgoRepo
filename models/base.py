@@ -13,19 +13,19 @@ class Base(nn.Module):
         super(Base, self).__init__()
 
     @abstractclassmethod
-    def forward(self, **kwargs) -> torch.Tensor:
+    def forward(self, *args, **kwargs) -> torch.Tensor:
         pass
 
     @abstractclassmethod
-    def loss(self,  **kwargs) -> torch.Tensor:
+    def loss(self, *args, **kwargs) -> torch.Tensor:
         pass
 
     @abstractclassmethod
-    def metric(self, ** kwargs) -> Dict[str, torch.Tensor]:
+    def metric(self, *args, ** kwargs) -> Dict[str, torch.Tensor]:
         pass
 
     @abstractclassmethod
-    def reset(self, **kwargs) -> Dict[str, torch.Tensor]:
+    def reset(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
         pass
 
     def compute_cl_loss(self, p: torch.Tensor, q: torch.Tensor, temperature, debiased=True, tau_plus=0.1):

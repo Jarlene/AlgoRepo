@@ -1,4 +1,4 @@
-from models.BaseModel import Base
+from models.base import Base
 from argparse import Namespace
 
 
