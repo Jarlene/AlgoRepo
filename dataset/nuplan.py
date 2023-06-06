@@ -13,10 +13,14 @@ from nuplan.planning.training.preprocessing.feature_builders.vector_map_feature_
 from nuplan.planning.training.preprocessing.features.generic_agents import GenericAgents
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import sampled_past_timestamps_to_tensor, sampled_past_ego_states_to_tensor, filter_agents_tensor, sampled_tracked_objects_to_tensor_list, compute_yaw_rate_from_state_tensors, convert_absolute_quantities_to_relative, pad_agent_states, pack_agents_tensor
-
+from datasets import load_dataset, Dataset
 NUPLAN_DATA_ROOT = '/media/jarlene/Samsung_T5/nuPlan/dataset/'
 NUPLAN_MAPS_ROOT = '/media/jarlene/Samsung_T5/nuPlan/dataset/map/'
 NUPLAN_MAP_VERSION = 'nuplan-maps-v1.0'
+
+
+
+Dataset.from_parquet()
 
 
 def get_scenario(db_path):
@@ -151,19 +155,25 @@ def processs(scenarios: List[AbstractScenario],  max_length, max_agent, save_dir
 
     splits = np.array_split(scenarios, num_workers)
     with ThreadPoolExecutor(max_workers=num_workers) as t:
-        all_task = [t.submit(internal_processs, list(array), 
-                                                max_length, 
-                                                max_agent, 
-                                                os.path.join(save_dir, 'mini_train_' + str(i) + '.pt')) for i, array in enumerate(splits)]
+        all_task = [t.submit(internal_processs, list(array),
+                             max_length,
+                             max_agent,
+                             os.path.join(save_dir, 'mini_train_' + str(i) + '.pt')) for i, array in enumerate(splits)]
         wait(all_task, return_when=ALL_COMPLETED)
-   
 
 
 class NuPlanDataSet(torch.utils.data.Dataset):
-
     def __init__(self, data: Dict):
-        self.ego = data['ego']
-        self.agent = data['agent']
+
+        self.ego = []
+        self.agent = []
+        for k, s in data.items():
+            if k == 'ego':
+                for v in s:
+                    self.ego.extend(v)
+            elif k == 'agent':
+                for v in s:
+                    self.agent.extend(v)
         self.len = len(self.ego)
 
     def __len__(self):
@@ -172,9 +182,10 @@ class NuPlanDataSet(torch.utils.data.Dataset):
     def __getitem__(self, index):
         ego = self.ego[index]
         agent = self.agent[index]
-        ego_x = ego[:-1,]
-        ego_y = ego[1:,]
-        agent_x = agent[:-1,]
-        agent_y = agent[1:,]
 
-        return {'feature': (ego_x, agent_x), 'target': (ego_y, agent_y)}
+        ego_x = ego[:50,]
+        ego_y = ego[50:-1,]
+        agent_x = agent[:50,]
+        agent_y = agent[50:-1,]
+
+        return {'feature': (ego_x.float(), agent_x.float()), 'target': (ego_y.float(), agent_y.float())}

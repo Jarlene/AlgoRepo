@@ -1,11 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.Layers import FeedForward, LayerNorm, RotaryEmbedding
+from layers.Layers import FeedForward, LayerNorm, RotaryEmbedding, MoE
 from typing import Optional, Tuple, Dict
 from einops import rearrange
 from models.base import Base
 from torch import einsum
+from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
+from metric.planning_metrics import AverageDisplacementError, FinalDisplacementError, AverageHeadingError, FinalHeadingError
+from collections import defaultdict
 
 
 def rotate_half(x):
@@ -16,20 +19,6 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(pos, t):
     return (t * pos.cos()) + (rotate_half(t) * pos.sin())
-
-
-def convert_head_mask_to_5d(head_mask, num_hidden_layers):
-    """-> [num_hidden_layers x batch x num_heads x seq_length x seq_length]"""
-    if head_mask.dim() == 1:
-        head_mask = head_mask.unsqueeze(0).unsqueeze(
-            0).unsqueeze(-1).unsqueeze(-1)
-        head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
-    elif head_mask.dim() == 2:
-        # We can specify head_mask for each layer
-        head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
-    assert head_mask.dim(
-    ) == 5, f"head_mask.dim != 5, instead {head_mask.dim()}"
-    return head_mask
 
 
 class GPTAttention(nn.Module):
@@ -164,14 +153,20 @@ class TrajGPT(Base):
             1, self.num_of_agent, args.hidden_size, args.hidden_size))
         self.agent_weight = nn.Parameter(torch.rand(
             self.num_of_agent - 1, self.num_of_agent, args.hidden_size, args.hidden_size))
+
+        self.metrics = {'mae': MeanAbsoluteError(),
+                        'mape': MeanAbsolutePercentageError(),
+                        'mse': MeanSquaredError(),
+                        'ade': AverageDisplacementError(),
+                        'fde': FinalDisplacementError(),
+                        'ahe': AverageHeadingError(),
+                        'fhe': FinalHeadingError()}
+
         self.ego_output = nn.Linear(args.hidden_size, 7)
         self.agent_output = nn.Linear(args.hidden_size, 8)
 
         self.register_buffer("pos_emb", None, persistent=False)
         self.register_buffer("mask", None, persistent=False)
-        self.register_buffer("ego_weight", self.ego_weight, persistent=True)
-        self.register_buffer(
-            "agent_weight", self.agent_weight, persistent=True)
 
     def get_rotary_embedding(self, n, device):
         if self.pos_emb is not None and self.pos_emb.shape[-2] >= n:
@@ -221,18 +216,36 @@ class TrajGPT(Base):
             atten_outputs.append(attn_outputs)
 
         x = self.ln(hidden_states)
+
         ego_ouput = einsum("b n s d, a s d d -> b n a d", x, self.ego_weight)
         ego_ouput = self.ego_output(ego_ouput)  # [batch_size x length x 1 x 7]
         agent_output = einsum(
             "b n s d, a s d d -> b n a d", x, self.agent_weight)
         agent_output = self.agent_output(agent_output)
-        return ego_ouput, agent_output, atten_outputs
+        return ego_ouput, agent_output
 
     def loss(self, feature, target):
         ego_x, agent_x = feature[0], feature[1]
         ego_y, agent_y = target[0], target[1]
-        ego_logits, agent_logits, _ = self.forward(ego_x, agent_x)
+        ego_logits, agent_logits, = self.forward(ego_x, agent_x)
         ego_logits = ego_logits.squeeze(-2)
         ego_loss = F.mse_loss(ego_logits, ego_y)
         agent_loss = F.mse_loss(agent_logits, agent_y)
         return ego_loss + agent_loss
+
+    def metric(self,  feature, target, **kwargs) -> Dict[str, torch.Tensor]:
+        res = {}
+        ego_x, agent_x = feature[0], feature[1]
+        ego_y, agent_y = target[0], target[1]
+        ego_logits, agent_logits = self.forward(ego_x, agent_x)
+        for k, m in self.metrics.items():
+            m.to(ego_x.device)
+            m.update(ego_logits, ego_y)
+            m.update(agent_logits, agent_y)
+            res[k] = m.compute()
+
+        return res
+
+    def reset(self):
+        for k, m in self.metrics.items():
+            m.reset()

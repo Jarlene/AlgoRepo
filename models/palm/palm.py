@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import einsum, nn
 from models.base import Base
-from layers.Layers import LayerNorm, Residual, RotaryEmbedding, SwiGLU
+from layers.Layers import LayerNorm, Residual, RotaryEmbedding, FeedForward
 
 
 def rotate_half(x):
@@ -22,9 +22,8 @@ class ParallelTransformerBlock(nn.Module):
         self.norm = LayerNorm(dim)
 
         attn_inner_dim = dim_head * heads
-        ff_inner_dim = dim * ff_mult
         self.fused_dims = (attn_inner_dim, dim_head,
-                           dim_head, (ff_inner_dim * 2))
+                           dim_head)
 
         self.heads = heads
         self.scale = dim_head**-0.5
@@ -34,10 +33,7 @@ class ParallelTransformerBlock(nn.Module):
             dim, sum(self.fused_dims), bias=False)
         self.attn_out = nn.Linear(attn_inner_dim, dim, bias=False)
 
-        self.ff_out = nn.Sequential(
-            SwiGLU(),
-            nn.Linear(ff_inner_dim, dim, bias=False)
-        )
+        self.ff_out = FeedForward(dim=dim, swish=True, glu=True, mult=ff_mult)
 
         # for caching causal mask and rotary embeddings
 
@@ -77,7 +73,7 @@ class ParallelTransformerBlock(nn.Module):
 
         # attention queries, keys, values, and feedforward inner
 
-        q, k, v, ff = self.fused_attn_ff_proj(x).split(self.fused_dims, dim=-1)
+        q, k, v = self.fused_attn_ff_proj(x).split(self.fused_dims, dim=-1)
 
         # split heads
         # they use multi-query single-key-value attention, yet another Noam Shazeer paper
@@ -115,7 +111,7 @@ class ParallelTransformerBlock(nn.Module):
         # merge heads
 
         out = rearrange(out, "b h n d -> b n (h d)")
-        return self.attn_out(out) + self.ff_out(ff)
+        return self.attn_out(out) + self.ff_out(x)
 
 
 class PaLM(Base):

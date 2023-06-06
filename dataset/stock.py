@@ -25,8 +25,38 @@ def preprocess(path, threadhold=90):
     return res
 
 
-class StockDateset(Dataset):
+class StockDatesetGPT(Dataset):
     def __init__(self, data: list, max_length=60) -> None:
+        super().__init__()
+        self.max_length = max_length
+
+        self.x = []
+        self.y = []
+        for i, d in enumerate(data):
+            n = len(d)
+            for i in range(1, n, max_length+1):
+                if i + max_length + 1 < n:
+                    x_sub = d[i:i+max_length]
+                    y_sub = d[1+i:i+max_length+1]
+                else:
+                    x_sub = d[i:-1]
+                    y_sub = d[1+i:]
+                self.x.append(x_sub)
+                self.y.append(y_sub)
+
+    def __len__(self):
+        return self.data_len
+
+    def __getitem__(self, index):
+
+        x, y = self.x[index], self.y[index]
+        x = torch.from_numpy(x).float()[:, :-1]
+        y = torch.from_numpy(y).float()[:, :-1]
+        return {'x': x, 'y': y}
+
+
+class StockDatesetT5(Dataset):
+    def __init__(self, data: list, max_length=70) -> None:
         super().__init__()
         self.max_length = max_length
 

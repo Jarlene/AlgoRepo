@@ -15,20 +15,11 @@ class AFM(Base):
         self.afm = AttentionalFactorizationMachine(
             args.embed_dim, args.attn_size, args.dropouts)
         self.criterion = torch.nn.BCELoss()
-        self.metrics = {}
-        if self.args.metrics is not None:
-            for m in self.args.metrics:
-                if m == 'auc':
-                    self.metrics[m] = AUROC(task="binary")
-                if m == 'precision':
-                    self.metrics[m] = Precision(
-                        task="binary", threshold=self.args.threshold)
-                if m == 'recall':
-                    self.metrics[m] = Recall(
-                        task="binary", threshold=self.args.threshold)
-                if m == 'acc':
-                    self.metrics[m] = Accuracy(
-                        task="binary", threshold=self.args.threshold)
+        self.metrics = {'auc': AUROC(task="binary"),
+                        'precision': Precision(task="binary", threshold=self.args.threshold),
+                        'recall': Recall(task="binary", threshold=self.args.threshold),
+                        'acc': Accuracy(task="binary", threshold=self.args.threshold)
+                        }
 
     def forward(self, x):
         x = self.linear(x) + self.afm(self.embedding(x))
@@ -41,20 +32,14 @@ class AFM(Base):
 
     def metric(self,  x, y, **kwargs) -> Dict[str, torch.Tensor]:
         res = {}
-        if len(self.metrics) > 0:
-            pred = self.forward(x)
-            for k, m in self.metrics.items():
-                m.to(x.device)
-                m.update(pred, y)
-                res[k] = m.compute()
+        pred = self.forward(x)
+        for k, m in self.metrics.items():
+            m.to(x.device)
+            m.update(pred, y)
+            res[k] = m.compute()
 
         return res
 
-    def reset(self) -> Dict[str, torch.Tensor]:
-        res = {}
-        if len(self.metrics) > 0:
-            for k, m in self.metrics.items():
-                res[k] = m.compute()
-                m.reset()
-
-        return res
+    def reset(self):
+        for k, m in self.metrics.items():
+            m.reset()

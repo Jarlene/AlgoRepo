@@ -25,7 +25,7 @@ class Base(nn.Module):
         pass
 
     @abstractclassmethod
-    def reset(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+    def reset(self, *args, **kwargs):
         pass
 
     def compute_cl_loss(self, p: torch.Tensor, q: torch.Tensor, temperature, debiased=True, tau_plus=0.1):

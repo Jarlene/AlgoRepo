@@ -17,20 +17,6 @@ def apply_rotary_pos_emb(pos, t):
     return (t * pos.cos()) + (rotate_half(t) * pos.sin())
 
 
-def convert_head_mask_to_5d(head_mask, num_hidden_layers):
-    """-> [num_hidden_layers x batch x num_heads x seq_length x seq_length]"""
-    if head_mask.dim() == 1:
-        head_mask = head_mask.unsqueeze(0).unsqueeze(
-            0).unsqueeze(-1).unsqueeze(-1)
-        head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
-    elif head_mask.dim() == 2:
-        # We can specify head_mask for each layer
-        head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
-    assert head_mask.dim(
-    ) == 5, f"head_mask.dim != 5, instead {head_mask.dim()}"
-    return head_mask
-
-
 class FintAttention(nn.Module):
 
     def __init__(self, args, is_cross_attention=False, layer_idx=None) -> None:
@@ -103,13 +89,13 @@ class FintAttention(nn.Module):
         query, key, value = self.fused_proj(
             hidden_states).split(self.embed_dim, dim=-1)
 
-        query = rearrange(query, "b n (h d) -> b h  n d", h=self.num_heads)
-        key = rearrange(key, "b n (h d) -> b h  n d", h=self.num_heads)
-        value = rearrange(value, "b n  (h d) -> b h n d", h=self.num_heads)
+        query = rearrange(query, "... (h d) -> ... n d", h=self.num_heads)
+        key = rearrange(key, "... (h d) -> ...  n d", h=self.num_heads)
+        value = rearrange(value, "... (h d) -> ... n d", h=self.num_heads)
 
         attn_output, attn_weights = self.attn(
             query, key, value, attention_mask)
-        attn_output = rearrange(attn_output, "b h n d -> b n (h d)")
+        attn_output = rearrange(attn_output, "b h ... n d -> b n ... (h d)")
         attn_output = self.proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
         return attn_output, attn_weights
@@ -150,14 +136,14 @@ class FintModel(Base):
         super().__init__()
         self.args = args
         self.embed_dim = args.hidden_size
-        self.embed = nn.Linear(5, self.embed_dim)
+        self.embed = nn.Linear(args.attris, self.embed_dim)
 
         self.drop = nn.Dropout(args.embd_pdrop)
         self.h = nn.ModuleList([Block(args, layer_idx=i)
                                for i in range(args.num_hidden_layers)])
         self.rotary_emb = RotaryEmbedding(self.embed_dim)
         self.ln = LayerNorm(self.embed_dim)
-        self.proj = nn.Linear(args.hidden_size, 5)
+        self.proj = nn.Linear(args.hidden_size, args.attris)
         self.register_buffer("pos_emb", None, persistent=False)
         self.register_buffer("mask", None, persistent=False)
         self.loss_fct = torch.nn.MSELoss()
@@ -200,11 +186,18 @@ class FintModel(Base):
         proj = self.proj(x)
         return proj, attn_outputs
 
+    def metric(self,  x, y) -> Dict[str, torch.Tensor]:
+        res = {}
+
+        return res
+
     def loss(self,
              x: torch.Tensor,
              y: torch.Tensor):
         logist, _ = self.forward(x)
         loss = self.loss_fct(logist, y)
-        if loss.isnan():
-            print('nan')
         return loss
+
+    def reset(self):
+        for k, m in self.metrics.items():
+            m.reset()

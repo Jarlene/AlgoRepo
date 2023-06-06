@@ -1,5 +1,5 @@
 
-from wrap import Wrap, AutoDateSet, train, get_train_args
+from models.wrap import Wrap, AutoDateSet, get_trainer, get_train_args
 from models.rec.AFM import AFM
 
 from dataset.criteo import CriteoDataset
@@ -25,7 +25,6 @@ def get_dataset(args):
 
 def main():
     args = get_train_args()
-    args.metrics = ['auc', 'precision', 'recall', 'acc']
     args.attn_size = 16
     args.embed_dim = 8
     args.dropouts = (0.2, 0.2)
@@ -34,11 +33,17 @@ def main():
     train_dataset, valid_dataset, test_dataset, field_dims = get_dataset(args)
     args.field_dims = field_dims
     model = get_model(args)
+    trainer = get_trainer(args)
+    if trainer.is_global_zero:
+        print(args)
+        print(
+            "-------------data size: {0}--------------".format(len(train_dataset)))
 
-    model = Wrap(model=model, args=args)
+    wrap = Wrap(model=model, args=args)
     data = AutoDateSet(train_dataset=train_dataset, val_dataset=valid_dataset, test_dataset=test_dataset, train_batch_size=args.batch_size,
                        val_batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_memory)
-    train(args, model, data)
+    trainer.fit(model=wrap, datamodule=data,
+                ckpt_path='last' if args.resume else None)
 
 
 if __name__ == "__main__":

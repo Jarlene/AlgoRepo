@@ -72,20 +72,18 @@ class Wrap(LightningModule):
         return loss
 
     def metrics(self, inputs, stage='train'):
-        metrics = self.attr('metrics')
-        if metrics is not None:
-            metrics_val = None
-            if isinstance(inputs, torch.Tensor):
-                metrics_val = self.model.metric(inputs)
-            elif isinstance(inputs, Dict):
-                metrics_val = self.model.metric(**inputs)
-            elif isinstance(inputs, (tuple, list)):
-                metrics_val = self.model.metric(*inputs)
-            else:
-                metrics_val = self.model.metric(inputs)
-            for k, v in metrics_val.items():
-                self.log(name=stage + '_' + k, value=v,
-                         sync_dist=True, logger=True)
+        metrics_val = None
+        if isinstance(inputs, torch.Tensor):
+            metrics_val = self.model.metric(inputs)
+        elif isinstance(inputs, Dict):
+            metrics_val = self.model.metric(**inputs)
+        elif isinstance(inputs, (tuple, list)):
+            metrics_val = self.model.metric(*inputs)
+        else:
+            metrics_val = self.model.metric(inputs)
+        for k, v in metrics_val.items():
+            self.log(name=stage + '_' + k, value=v,
+                     sync_dist=True, logger=True)
 
     def training_step(self, batch, batch_idx):
         inputs = self.prepare_inputs(batch)
@@ -106,28 +104,13 @@ class Wrap(LightningModule):
         return loss
 
     def on_train_epoch_end(self):
-        metrics = self.attr('metrics')
-        if metrics is not None:
-            metrics_val = self.model.reset()
-            for k, v in metrics_val.items():
-                self.log(name='train_epoch_' + k, value=v,
-                         sync_dist=True, logger=True)
+        self.model.reset()
 
     def on_validation_epoch_end(self):
-        metrics = self.attr('metrics')
-        if metrics is not None:
-            metrics_val = self.model.reset()
-            for k, v in metrics_val.items():
-                self.log(name='val_epoch_' + k, value=v,
-                         sync_dist=True, logger=True)
+        self.model.reset()
 
     def on_test_epoch_end(self):
-        metrics = self.attr('metrics')
-        if metrics is not None:
-            metrics_val = self.model.reset()
-            for k, v in metrics_val.items():
-                self.log(name='test_epoch_' + k, value=v,
-                         sync_dist=True, logger=True)
+        self.model.reset()
 
     def configure_optimizers(self):
         optim = AdamW(params=self.model.parameters(),
@@ -234,6 +217,29 @@ def train(args: Namespace, model: Wrap, data: AutoDateSet):
     runner.fit(model=model, datamodule=data,
                ckpt_path='last' if args.resume else None)
 
+    return runner
+
+
+def get_trainer(args: Namespace):
+    logger = TensorBoardLogger(
+        save_dir=args.log_dir, log_graph=True, name=args.name, version=args.version)
+    runner = Trainer(
+        logger=logger,
+        strategy='auto',
+        callbacks=[
+            LearningRateMonitor(),
+            ModelCheckpoint(save_top_k=2,
+                            dirpath=os.path.join(
+                                args.save_dir, "checkpoints", args.name),
+                            monitor=args.monitor,
+                            save_last=True),
+            EarlyStopping(monitor=args.monitor),
+            GradientAccumulationScheduler(scheduling={2: 1}),
+            TQDMProgressBar(),
+            ModelSummary(2),
+        ],
+        plugins=[TorchCheckpointIO()],
+        max_epochs=args.num_epochs)
     return runner
 
 

@@ -2,7 +2,7 @@ import gzip
 import numpy as np
 import torch
 from models.palm.palm import PaLM
-from experiment import AutoDateSet, Experiment, train, get_train_args
+from models.wrap import AutoDateSet, Wrap, get_trainer, get_train_args
 from torch.utils.data import Dataset
 
 NUM_BATCHES = int(1e5)
@@ -58,12 +58,11 @@ def get_args():
     args = get_train_args()
     args.dim = 512
     args.depth = 8
-    args.label = 'label'
+    args.label = 'y'
     args.num_tokens = 10000
     args.dim_head = 64
     args.metric = True
     args.heads = 8
-    print(args)
     return args
 
 
@@ -72,6 +71,13 @@ if __name__ == '__main__':
     path = '/home/jarlene/Code/Projects/Experiment/data/enwik8.gz'
     data = get_dataSets(path, args)
     model = get_model(args)
-    experiment = Experiment(model, args)
+    trainer = get_trainer(args)
+    if trainer.is_global_zero:
+        print(args)
+        print(
+            "-------------data size: {0}--------------".format(len(data.train_dataset)))
 
-    train(args, experiment, data)
+    example = data.train_dataset[0]['x'].unsqueeze(0)
+    wrap = Wrap(model, args, example)
+    trainer.fit(model=wrap, datamodule=data,
+                ckpt_path='last' if args.resume else None)
