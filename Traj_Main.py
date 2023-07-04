@@ -1,8 +1,8 @@
 import torch
 
-from dataset.nuplan import NuPlanDataSet
+from dataset.nuplan import NuPlanDataSetT5
 from models.wrap import AutoDateSet, Wrap, get_trainer, get_train_args
-from models.trajectory.traj_gpt_moe import TrajGPT
+from models.trajectory.traj_gpt import TrajGPT
 
 
 def get_model(args):
@@ -12,17 +12,16 @@ def get_model(args):
 
 def get_data(args):
     data = torch.load(args.train_file)
-    train_dataset = NuPlanDataSet(data)
+    train_dataset = NuPlanDataSetT5(data)
     return train_dataset
 
 
 def get_args():
     args = get_train_args()
     args.batch_size = 2
-    args.label = 'target'
-    args.name = 'traj'
+    args.name = 'traj_gpt'
     args.max_length = 100
-    args.num_of_agent = 80
+
     args.hidden_size = 128
     args.embd_pdrop = 0.5
     args.num_hidden_layers = 12
@@ -31,6 +30,17 @@ def get_args():
     args.attn_pdrop = 0.5
     args.num_heads = 8
     args.train_file = '/home/jarlene/Code/Projects/Experiment/data/traj/traj.pt'
+
+    args.ego_attribs = 7
+    args.agent_attribs = 8
+    args.num_of_agents = 80
+    args.use_lane = False
+    # moe
+    args.use_moe = True
+    args.num_experts = 100
+    args.topk = 10
+    args.expert_capacity = 4
+    args.router_jitter_noise = 0.1
     return args
 
 

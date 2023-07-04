@@ -11,6 +11,8 @@ from typing import List, Union, Any, Optional, Dict
 from models.base import Base
 from lightning.pytorch.core import LightningModule, LightningDataModule
 from lightning.pytorch.trainer import Trainer
+from lightning.pytorch.profilers import PyTorchProfiler
+from lightning.pytorch.plugins.environments import TorchElasticEnvironment, LightningEnvironment, SLURMEnvironment, MPIEnvironment
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.plugins import TorchCheckpointIO
 from lightning.pytorch.callbacks import (
@@ -22,6 +24,9 @@ from lightning.pytorch.callbacks import (
     TQDMProgressBar,
     DeviceStatsMonitor
 )
+
+from accelerate import Accelerator
+from accelerate.utils import DeepSpeedPlugin, FullyShardedDataParallelPlugin, MegatronLMPlugin
 
 
 class Wrap(LightningModule):
@@ -35,12 +40,6 @@ class Wrap(LightningModule):
         self.model = model
         self.args = args
         self.example_input_array = example
-
-    def attr(self, name):
-        if self.args is not None:
-            if hasattr(self.args, name):
-                return getattr(self.args, name)
-        return None
 
     def prepare_inputs(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         if isinstance(data, Dict):
@@ -57,7 +56,7 @@ class Wrap(LightningModule):
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
-    def loss(self, inputs, stage='train'):
+    def loss(self, inputs, stage='train', prog_bar=True):
         loss = -1.0
         if isinstance(inputs, torch.Tensor):
             loss = self.model.loss(inputs)
@@ -68,7 +67,7 @@ class Wrap(LightningModule):
         else:
             loss = self.model.loss(inputs)
         self.log(name=stage + '_loss', value=loss,
-                 sync_dist=True, prog_bar=True, logger=True)
+                 sync_dist=True, prog_bar=prog_bar, logger=True)
         return loss
 
     def metrics(self, inputs, stage='train'):
@@ -87,19 +86,19 @@ class Wrap(LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs = self.prepare_inputs(batch)
-        loss = self.loss(inputs)
+        loss = self.loss(inputs, stage='train')
         self.metrics(inputs)
         return loss
 
     def validation_step(self, batch, batch_idx):
         inputs = self.prepare_inputs(batch)
-        loss = self.loss(inputs, stage='val')
+        loss = self.loss(inputs, stage='val', prog_bar=False)
         self.metrics(inputs, stage='val')
         return loss
 
     def test_step(self, batch, batch_idx):
         inputs = self.prepare_inputs(batch)
-        loss = self.loss(inputs, stage='test')
+        loss = self.loss(inputs, stage='test', prog_bar=False)
         self.metrics(inputs, stage='test')
         return loss
 
@@ -118,9 +117,8 @@ class Wrap(LightningModule):
         return {
             "optimizer": optim,
             "lr_scheduler": {
-                "scheduler": StepLR(optim, step_size=100),
-                "interval": "step",  # 调度的单位，epoch或step
-                "frequency": 100,  # 调度的频率，多少轮一次
+                "scheduler": ReduceLROnPlateau(optim),
+                "monitor": "val_loss",
             },
         }
 
@@ -186,38 +184,11 @@ class AutoDateSet(LightningDataModule):
                 num_workers=self.num_workers,
                 collate_fn=self.collate_fn,
                 pin_memory=self.pin_memory,
-                shuffle=True,
+                shuffle=False,
                 drop_last=True,
             )
 
         return None
-
-
-def train(args: Namespace, model: Wrap, data: AutoDateSet):
-    logger = TensorBoardLogger(
-        save_dir=args.log_dir, log_graph=True, name=args.name, version=args.version)
-    runner = Trainer(
-        logger=logger,
-        strategy='auto',
-        callbacks=[
-            LearningRateMonitor(),
-            ModelCheckpoint(save_top_k=2,
-                            dirpath=os.path.join(
-                                args.save_dir, "checkpoints", args.name),
-                            monitor=args.monitor,
-                            save_last=True),
-            EarlyStopping(monitor=args.monitor),
-            GradientAccumulationScheduler(scheduling={2: 1}),
-            TQDMProgressBar(),
-            ModelSummary(2),
-            DeviceStatsMonitor()
-        ],
-        plugins=[TorchCheckpointIO()],
-        max_epochs=args.num_epochs)
-    runner.fit(model=model, datamodule=data,
-               ckpt_path='last' if args.resume else None)
-
-    return runner
 
 
 def get_trainer(args: Namespace):
@@ -225,7 +196,8 @@ def get_trainer(args: Namespace):
         save_dir=args.log_dir, log_graph=True, name=args.name, version=args.version)
     runner = Trainer(
         logger=logger,
-        strategy='auto',
+        strategy=args.strategy,
+        devices=args.devices,
         callbacks=[
             LearningRateMonitor(),
             ModelCheckpoint(save_top_k=2,
@@ -238,7 +210,8 @@ def get_trainer(args: Namespace):
             TQDMProgressBar(),
             ModelSummary(2),
         ],
-        plugins=[TorchCheckpointIO()],
+        plugins=[TorchCheckpointIO(), TorchElasticEnvironment()],
+        # profiler=PyTorchProfiler(),
         max_epochs=args.num_epochs)
     return runner
 
@@ -250,7 +223,10 @@ def get_train_args():
     group.add_argument("--lr", type=float, default=0.000001)
     group.add_argument("--weight_decay", type=float, default=0.0)
     group.add_argument("--resume", action="store_true")
+    group.add_argument("--split_head", type=bool, default=True)
     group.add_argument("--save_dir", type=str,  default='save')
+    group.add_argument("--strategy",  default='auto')
+    group.add_argument("--devices", default='auto')
     group.add_argument("--log_dir", type=str,  default='logs')
     group.add_argument("--name", type=str,  default='tensorboard')
     group.add_argument("--version", type=str,  default='v1')
@@ -261,3 +237,25 @@ def get_train_args():
     group.add_argument("--label", type=str, default=None)
     args, unknow = parser.parse_known_args()
     return args
+
+
+def getAccelerator(args):
+
+    if args.use_deepspeed:
+        deepspeed = DeepSpeedPlugin()
+        deepspeed.gradient_accumulation_steps = args.gradient_accumulation_steps
+        deepspeed.zero_stage = args.zero_stage
+    if args.use_fsdp:
+        fsdp = FullyShardedDataParallelPlugin()
+    if args.use_megatron:
+        megatron = MegatronLMPlugin()
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        log_with='tensorboard',
+        logging_dir=os.path.join(args.log_dir, args.name, args.version),
+        deepspeed_plugin=deepspeed,
+        fsdp_plugin=fsdp,
+        megatron_lm_plugin=megatron,
+    )
+    accelerator.init_trackers(project_name="")

@@ -9,6 +9,7 @@ from argparse import Namespace
 from einops import rearrange, einsum
 import torch
 from torch.optim.optimizer import Optimizer
+from transformers.activations import ACT2FN
 
 
 class LayerNorm(torch.nn.Module):
@@ -83,15 +84,14 @@ class SwiGLU(nn.Module):
 
 
 class GLU(nn.Module):
-    def __init__(self, dim_in, activation, dim_out=None):
+    def __init__(self, dim_in, dim_out=None):
         super().__init__()
-        self.act = activation
         dim_out = dim_out if dim_out is not None else dim_in
         self.proj = nn.Linear(dim_in, dim_out * 2)
 
     def forward(self, x):
         x, gate = self.proj(x).chunk(2, dim=-1)
-        return x * self.act(gate)
+        return x * F.silu(gate)
 
 
 class ReluSquared(nn.Module):
@@ -126,7 +126,7 @@ class FeedForward(torch.nn.Module):
         project_in = nn.Sequential(
             nn.Linear(dim, inner_dim, bias=not no_bias),
             activation
-        ) if not glu else GLU(dim, inner_dim, activation)
+        ) if not glu else GLU(dim, inner_dim)
 
         self.ff = nn.Sequential(
             project_in,
@@ -1023,17 +1023,20 @@ class SelfAttention(nn.Module):
 
     def __init__(self, args: Namespace) -> None:
         super(SelfAttention, self).__init__()
-        self.embed_dim = args.embed_dim
-        self.num_heads = args.num_heads
-        self.norm = LayerNorm(self.embed_dim)
-        self.fused_proj = nn.Linear(
-            self.embed_dim, self.embed_dim * 3, bias=False)
+        self.split_head = args.split_head
+        self.hidden_size = args.hidden_size
+        if self.split_head:
+            self.num_heads = args.num_heads
+            self.head_dim = self.hidden_size//self.num_heads
 
-        self.scale = (self.embed_dim/args.num_heads)**-0.5
+        self.norm = LayerNorm(self.hidden_size)
+        self.fused_proj = nn.Linear(
+            self.hidden_size, self.hidden_size * 3, bias=False)
+
         self.register_buffer('mask', None, False)
 
     def get_mask(self, n, device):
-        if self.mask is not None and self.mask.size(-1) >= n:
+        if self.mask is not None:
             return self.mask
 
         mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
@@ -1045,17 +1048,22 @@ class SelfAttention(nn.Module):
         n, device = x.shape[1], x.device
 
         query, key, value = self.fused_proj(
-            x).split(self.embed_dim, dim=-1)
+            x).split(self.hidden_size, dim=-1)
+        if self.split_head:
+            query = rearrange(
+                query, 'b n ... (h d) ->  b h ... n d', h=self.num_heads)
+            key = rearrange(
+                key, 'b n ... (h d) ->  b h ... n d', h=self.num_heads)
+            value = rearrange(
+                value, 'b n ... (h d) ->  b h ... n d', h=self.num_heads)
+        else:
+            query = rearrange(query, 'b n ... h d -> b h ... n d')
+            key = rearrange(key, 'b n ... h d -> b h ... n d')
+            value = rearrange(value, 'b n ... h d -> b h ... n d')
 
-        query = rearrange(query, '... (h d) -> ... h d', h=self.num_heads)
-        key = rearrange(key, '... (h d) -> ... h d', h=self.num_heads)
-        value = rearrange(value, '... (h d) -> ... h d', h=self.num_heads)
-
-        query = query * self.scale
-
-        query = rearrange(query, 'b n ... h d -> b h ... n d')
-        key = rearrange(key, 'b n ... h d -> b h ... n d')
-        value = rearrange(value, 'b n ... h d -> b h ... n d')
+        scale = torch.full([], value.size(-1) ** -0.5,
+                           dtype=value.dtype, device=value.device)
+        query = query * scale
 
         sim = einsum(query, key, "... q d, ... k d -> ... q k")
         mask = self.get_mask(n, device)
@@ -1063,57 +1071,70 @@ class SelfAttention(nn.Module):
 
         attn = sim.softmax(dim=-1)
         out = einsum(attn, value, "... n d, ... d k-> ... n k")
-        out = rearrange(out, 'b h ... n d -> b n ... (h d)')
+        if self.split_head:
+            out = rearrange(out, 'b h ... n d -> b n ... (h d)')
+        else:
+            out = rearrange(out, 'b h ... n d -> b n ... h d')
         return out
 
 
 class CrossAttention(nn.Module):
     def __init__(self, args: Namespace) -> None:
         super(CrossAttention, self).__init__()
-        self.embed_dim = args.embed_dim
-        self.num_heads = args.num_heads
-        self.norm = LayerNorm(self.embed_dim)
-        self.fused_proj = nn.Linear(
-            self.embed_dim, self.embed_dim * 2, bias=False)
+        self.hidden_size = args.hidden_size
+        self.split_head = args.split_head
+        if self.split_head:
+            self.num_heads = args.num_heads
+            self.head_dim = self.hidden_size//self.num_heads
 
-        self.scale = (self.embed_dim/args.num_heads)**-0.5
+        self.norm = LayerNorm(self.hidden_size)
+        self.fused_proj = nn.Linear(
+            self.hidden_size, self.hidden_size * 2, bias=False)
 
         self.register_buffer('mask', None, False)
 
-    def get_mask(self, n, device):
-        if self.mask is not None and self.mask.size(-1) >= n:
+    def get_mask(self, n, m, device):
+        if self.mask is not None:
             return self.mask
 
-        mask = torch.ones((n, n), device=device, dtype=torch.bool).triu(1)
+        mask = torch.ones((n, m), device=device, dtype=torch.bool).triu(1)
         self.register_buffer("mask", mask, persistent=True)
         return mask
 
     def forward(self, query: torch.Tensor, key_value: torch.Tensor):
 
         n, device = query.shape[1], query.device
+        m = key_value.shape[1]
 
         query = self.norm(query)
         key, value = self.fused_proj(
-            key_value).split(self.embed_dim, dim=-1)
+            key_value).split(self.hidden_size, dim=-1)
+        if self.split_head:
+            query = rearrange(
+                query, 'b n ... (h d) ->  b h ... n d', h=self.num_heads)
+            key = rearrange(
+                key, 'b n ... (h d) ->  b h ... n d', h=self.num_heads)
+            value = rearrange(
+                value, 'b n ... (h d) ->  b h ... n d', h=self.num_heads)
+        else:
+            query = rearrange(query, 'b n ... h d -> b h ... n d')
+            key = rearrange(key, 'b n ... h d -> b h ... n d')
+            value = rearrange(value, 'b n ... h d -> b h ... n d')
 
-        query = rearrange(query, '... (h d) -> ... h d', h=self.num_heads)
-        key = rearrange(key, '... (h d) -> ... h d', h=self.num_heads)
-        value = rearrange(value, '... (h d) -> ... h d', h=self.num_heads)
-
-        query = query * self.scale
-        if query.dim() != key.dim():
-            query = query.unsqueeze(-3)
-        query = rearrange(query, 'b n ... h d -> b h ... n d')
-        key = rearrange(key, 'b n ... h d -> b h ... n d')
-        value = rearrange(value, 'b n ... h d -> b h ... n d')
+        scale = torch.full([], value.size(-1) ** -0.5,
+                           dtype=value.dtype, device=value.device)
+        query = query * scale
 
         sim = einsum(query, key, "... q d, ... k d -> ... q k")
-        mask = self.get_mask(n, device)
+        mask = self.get_mask(n, m, device)
         sim = sim.masked_fill(mask, -torch.finfo(sim.dtype).max)
 
         attn = sim.softmax(dim=-1)
         out = einsum(attn, value, "... n d, ... d k-> ... n k")
-        out = rearrange(out, 'b h ... n d -> b n ... (h d)')
+        if self.split_head:
+            out = rearrange(out, 'b h ... n d -> b n ... (h d)')
+        else:
+            out = rearrange(out, 'b h ... n d -> b n ... h d')
         return out
 
 
@@ -1133,31 +1154,31 @@ class DualAttenion(nn.Module):
         self.num_heads = args.num_heads
         self.c_in = args.enc_in
         # attention related
-        self.qkv = nn.Linear(args.embed_dim, args.embed_dim * 3, bias=True)
+        self.qkv = nn.Linear(args.hidden_size, args.hidden_size * 3, bias=True)
         self.attn_dropout = nn.Dropout(args.dropout)
-        self.head_dim = args.embed_dim // args.num_heads
+        self.head_dim = args.hidden_size // args.num_heads
         self.dropout_mlp = nn.Dropout(args.dropout)
-        self.mlp = nn.Linear(args.embed_dim, args.embed_dim)
+        self.mlp = nn.Linear(args.hidden_size, args.hidden_size)
         self.norm_post1 = nn.Sequential(Transpose(1, 2),
-                                        nn.BatchNorm1d(args.embed_dim,
+                                        nn.BatchNorm1d(args.hidden_size,
                                                        momentum=args.momentum),
                                         Transpose(1, 2))
         self.norm_post2 = nn.Sequential(Transpose(1, 2),
-                                        nn.BatchNorm1d(args.embed_dim,
+                                        nn.BatchNorm1d(args.hidden_size,
                                                        momentum=args.momentum),
                                         Transpose(1, 2))
         self.norm_attn = nn.Sequential(Transpose(1, 2),
-                                       nn.BatchNorm1d(args.embed_dim,
+                                       nn.BatchNorm1d(args.hidden_size,
                                                       momentum=args.momentum),
                                        Transpose(1, 2))
-        self.ff_1 = nn.Sequential(nn.Linear(args.embed_dim, args.d_ff, bias=True),
+        self.ff_1 = nn.Sequential(nn.Linear(args.hidden_size, args.d_ff, bias=True),
                                   nn.GELU(),
                                   nn.Dropout(args.dropout),
-                                  nn.Linear(args.d_ff, args.embed_dim, bias=True))
-        self.ff_2 = nn.Sequential(nn.Linear(args.embed_dim, args.d_ff, bias=True),
+                                  nn.Linear(args.d_ff, args.hidden_size, bias=True))
+        self.ff_2 = nn.Sequential(nn.Linear(args.hidden_size, args.d_ff, bias=True),
                                   nn.GELU(),
                                   nn.Dropout(args.dropout),
-                                  nn.Linear(args.d_ff, args.embed_dim, bias=True))
+                                  nn.Linear(args.d_ff, args.hidden_size, bias=True))
 
         # dynamic projection related
         self.dp_rank = args.dp_rank
@@ -1230,3 +1251,132 @@ class DualAttenion(nn.Module):
         src = src.reshape(B, nvars, -1, self.num_heads * self.head_dim)
 
         return src
+
+
+class Router(nn.Module):
+
+    def __init__(self, num_experts, topk, expert_capacity, hidden_size, router_jitter_noise):
+        super().__init__()
+        self.num_experts = num_experts
+        self.expert_capacity = expert_capacity
+        self.classifier = nn.Linear(hidden_size, self.num_experts)
+        self.jitter_noise = router_jitter_noise
+        self.topk = topk
+
+    def _compute_router_probabilities(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""
+        Computes router probabilities from input hidden states.
+
+        Args:
+            hidden_states (`torch.Tensor`):
+                (batch_size, sequence_length, hidden_dim) from which router probabilities are computed.
+        Returns:
+            router_probabilities (`torch.Tensor`):
+                Tensor of shape (batch_size, sequence_length, num_experts) corresponding to the probabilities for each
+                token and expert. Used for routing tokens to experts.
+            router_logits (`torch.Tensor`):
+                Logits tensor of shape (batch_size, sequence_length, num_experts) corresponding to raw router logits.
+                This is used later for computing router z-loss.
+        """
+        # float32 is used to ensure stability. See the discussion of "selective precision" in
+        # https://arxiv.org/abs/2101.03961.
+        # We also store the previous dtype to cast back the output to the previous dtype
+
+        if self.jitter_noise > 0 and self.training:
+            # Get the lower and upper bound of the uniform distribution
+            # Adapted from: https://stackoverflow.com/questions/44328530/how-to-get-a-uniform-distribution-in-a-range-r1-r2-in-pytorch
+            distrib_lower_bound = 1.0 - self.jitter_noise
+            distrib_upper_bound = 1.0 + self.jitter_noise
+
+            uniform_distrib = torch.rand(
+                hidden_states.shape, device=hidden_states.device, dtype=hidden_states.dtype, requires_grad=False)
+            uniform_distrib = uniform_distrib * \
+                (distrib_lower_bound - distrib_upper_bound)
+
+            uniform_distrib = uniform_distrib + distrib_upper_bound
+            # Multiply the token inputs by the uniform distribution - adding some noise
+            hidden_states *= uniform_distrib
+
+        # Shape: [num_groups, tokens_per_group, num_experts]
+        router_logits = self.classifier(hidden_states)
+
+        # Apply Softmax and cast back to the original `dtype`
+        router_probabilities = nn.functional.softmax(router_logits, dim=-1)
+        return router_probabilities, router_logits
+
+    def forward(self, hidden_states: torch.Tensor) -> Tuple:
+        r"""
+        Generic forward function for every Router class. Each Router expects to have the same input hidden states
+        (`hidden_states`) corresponding to the hidden states for each token, the `expert_capacity` corresponding to the
+        number of tokens the Router will send to each expert, some Routers can send up to few tokens to each expert.
+
+        Each Router works as the following: it expects the hidden states for each token, gets the `router_probs` and
+        `router_logits` from the `router_weights`. This will assign for each token, the raw probability to be assigned
+        to an expert. Then each Router class will have to define its own `_compute_routing_instructions`.
+
+        Args:
+            hidden_states (`torch.Tensor`) :
+                [num_groups, tokens_per_group, hidden_dim] inputs to send to experts.
+        Returns:
+            Tuple[`torch.Tensor`, `torch.Tensor`, `torch.Tensor`] Tuple containing the expert index, the router probs
+            and the router logits. The router probabilities and logits are required to compute the loss.
+        """
+        router_probs, router_logits = self._compute_router_probabilities(
+            hidden_states)
+
+        router_probs, expert_index = torch.topk(
+            router_probs, k=self.topk, dim=-1)
+        expert_index_onehot = torch.nn.functional.one_hot(
+            expert_index, num_classes=self.num_experts)
+
+        # Mask tokens outside expert capacity. Sum over each sequence
+        token_priority = torch.cumsum(expert_index_onehot, dim=-3)
+        # mask if the token routed to to the expert will overflow
+        expert_capacity_mask = token_priority <= self.expert_capacity
+        expert_index_onehot = expert_index_onehot * expert_capacity_mask
+
+        return expert_index_onehot, router_probs, router_logits
+
+
+class MoERouterLayer(nn.Module):
+
+    def __init__(self, num_experts, topk, expert_capacity, hidden_size, router_jitter_noise, expert: nn.Module = None):
+        super().__init__()
+        # Step 1: Get the correct router according to its class
+        self.router = Router(num_experts=num_experts, topk=topk, expert_capacity=expert_capacity,
+                             hidden_size=hidden_size, router_jitter_noise=router_jitter_noise)
+
+        # Step 2: Get the experts
+        self.experts = nn.ModuleDict()
+        if expert is None:
+            expert = FeedForward(hidden_size, glu=True)
+        for idx in range(num_experts):
+            self.experts[f"expert_{idx}"] = copy.deepcopy(expert)
+
+    def forward(self, hidden_states: torch.Tensor):
+        r"""
+        Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
+
+        1- Gets the `router_mask` from the router. The shape of the mask is `(batch_size, sequence_length, num_expert)`
+        and corresponds to the argmax of the `router_probs`. The probabilities are needed in the computation of the
+        hidden states : they are broadcasted to the hidden states values (can be interpreted as a scaling factor).
+
+        2- Dispatch the tokens to its associated experts. We do a classic for loop over the experts and assign for each
+        expert the corresponding hidden states.
+
+        """
+        # Step 1: Get the router_mask from the router as wel as the probabilities
+        router_mask, router_probs, router_logits = self.router(hidden_states)
+
+        # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
+        # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
+
+        next_states = hidden_states.clone()
+        for idx, expert in enumerate(self.experts.values()):
+            for j in range(self.router.topk):
+                token_indices = router_mask[..., j, idx].bool()
+                next_states[token_indices] = expert(
+                    hidden_states[token_indices])
+                next_states = router_probs[..., j].unsqueeze(-1) * next_states
+        hidden_states = next_states
+        return hidden_states, router_logits

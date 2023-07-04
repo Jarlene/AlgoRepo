@@ -19,8 +19,59 @@ NUPLAN_MAPS_ROOT = '/media/jarlene/Samsung_T5/nuPlan/dataset/map/'
 NUPLAN_MAP_VERSION = 'nuplan-maps-v1.0'
 
 
+class Lane:
+    id: str
+    left_width: float
+    right_width: float
+    path: List[List[float]]
+    max_speed: float
+    ego_on_lane: bool
+    lane_len: float
+    has_traffic_lights: bool
+    has_stop_line: bool
+    has_left_lane_id: bool
+    has_right_lane_id: bool
+    # need one-hot
+    index: int
+    left_lane_type: int
+    right_lane_type: int
+    traffic_lights_status: int
+    turn_type: int
 
-Dataset.from_parquet()
+    is_padding = False
+    # to get completed lane
+    next = None
+    pre = None
+
+    def __str__(self):
+        return "id: " + self.id + ", index:" + str(self.index)
+
+    def to_numpy(self):
+        if self.max_speed is None:
+            max_speed = 20
+        else:
+            max_speed = self.max_speed if not np.isnan(
+                float(self.max_speed)) else 20.0
+        ego_on_lane = 1.0 if self.ego_on_lane else 0
+        has_traffic_lights = 1.0 if self.has_traffic_lights else 0.0
+        has_stop_line = 1.0 if self.has_stop_line else 0.0
+        has_left_lane_id = 1.0 if self.has_left_lane_id else 0.0
+        has_right_lane_id = 1.0 if self.has_right_lane_id else 0.0
+        is_padding = 1.0 if self.is_padding else 0.0
+        attr = np.array([self.left_width, self.right_width, max_speed, ego_on_lane, self.lane_len,
+                         has_traffic_lights, has_stop_line, has_left_lane_id, has_right_lane_id, is_padding])
+
+        sample = np.linspace(0, len(self.path) - 1,  num=200,
+                             endpoint=True, retstep=False, dtype=np.int32).tolist()
+        path = []
+        for i in sample:
+            path.append(self.path[i])
+        path = np.array(path).reshape(-1)
+        continue_feature = np.concatenate([path, attr])
+
+        category_feature = np.array(
+            [self.index, self.left_lane_type, self.right_lane_type, self.traffic_lights_status, self.turn_type])
+        return {'continue': continue_feature, 'category': category_feature}
 
 
 def get_scenario(db_path):
@@ -162,7 +213,7 @@ def processs(scenarios: List[AbstractScenario],  max_length, max_agent, save_dir
         wait(all_task, return_when=ALL_COMPLETED)
 
 
-class NuPlanDataSet(torch.utils.data.Dataset):
+class NuPlanDataSetT5(torch.utils.data.Dataset):
     def __init__(self, data: Dict):
 
         self.ego = []
@@ -189,3 +240,69 @@ class NuPlanDataSet(torch.utils.data.Dataset):
         agent_y = agent[50:-1,]
 
         return {'feature': (ego_x.float(), agent_x.float()), 'target': (ego_y.float(), agent_y.float())}
+
+
+class NuPlanDataSetGPT(torch.utils.data.Dataset):
+
+    def __init__(self, data, args):
+        self.len = data.num_rows
+        self.data = data
+        self.args = args
+
+    def __len__(self):
+        return self.len
+
+    def __getitem__(self, index):
+        item = self.data[index]
+
+        ego = item['ego']
+        agents = item['agents']
+        if agents.shape[1] >= self.args.num_of_agents:
+            agents = agents[:, :self.args.num_of_agents, ...]
+        else:
+            diff = self.args.num_of_agents - agents.shape[1]
+            padd = torch.zeros([agents.shape[0], diff, agents.shape[-1]])
+            agents = torch.cat([agents, padd], dim=1)
+
+        lanes = item['lanes']
+        lane_arrtib_fix = []
+        lane_path_fix = []
+        for frame in lanes:
+            lane_arrtibs = []
+            lane_paths = []
+            for l in frame:
+                lane_arrtib = l['lane_atttrib']
+                lane_path = l['path']
+                lane_arrtibs.append(lane_arrtib)
+                lane_paths.append(lane_path)
+            lane_path = torch.stack(lane_paths)
+            lane_arrtib = torch.stack(lane_arrtibs)
+            if lane_path.shape[0] >= self.args.num_of_lanes:
+                lane_path = lane_path[:self.args.num_of_lanes, ...]
+                lane_arrtib = lane_arrtib[:self.args.num_of_lanes, ...]
+            else:
+                diff = self.args.num_of_lanes - lane_path.shape[0]
+                lane_path_padd = torch.zeros(
+                    [diff, lane_path.shape[1], lane_path.shape[-1]])
+                lane_arrtib_padd = torch.zeros([diff, lane_arrtib.shape[1]])
+                lane_path = torch.cat([lane_path, lane_path_padd], dim=0)
+                lane_arrtib = torch.cat([lane_arrtib, lane_arrtib_padd], dim=0)
+            lane_arrtib_fix.append(lane_arrtib)
+            lane_path_fix.append(lane_path)
+
+        lane_path = torch.stack(lane_path_fix)
+        lane_arrtib = torch.stack(lane_arrtib_fix)
+        if lane_path.shape[0] != self.args.max_length + 1:
+            diff = self.args.max_length + 1 - lane_path.shape[0]
+            pdd = torch.zeros(
+                [diff, lane_path.shape[1],  lane_path.shape[2], lane_path.shape[3]])
+            lane_path = torch.cat([pdd, lane_path], dim=0)
+            pddd = torch.zeros(
+                [diff, lane_arrtib.shape[1], lane_arrtib.shape[2]])
+            lane_arrtib = torch.cat([pddd, lane_arrtib], dim=0)
+
+        y_ego = ego[1:, ..., :-1]
+        y_agents = agents[1:, ...]
+        return {'ego': ego[:self.args.max_length, ..., :-1], 'agents': agents[:self.args.max_length, ...],
+                'lanes': (lane_path[:self.args.max_length, ...], lane_arrtib[:self.args.max_length, ...]),
+                'y_ego': y_ego, 'y_agents': y_agents}

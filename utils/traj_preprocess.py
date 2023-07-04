@@ -9,6 +9,117 @@ TRAIN_NUPLAN_DB_FILES = 'path/to/db/files'
 SAVE_DIR = 'path/to/save'
 
 
+def process_maps(lanes):
+    new_lanes = []
+    for frame in lanes:
+        if len(frame) == 0:
+            continue
+        new_frame = []
+        for l in frame:
+            left_width = min(l['left_width'], 2.0)
+            right_width = min(l['right_width'], 2.0)
+            max_speed = l['max_speed'] if not np.isnan(
+                l['max_speed']) else 15.0
+            ego_on_lane = 1 if l['ego_on_lane'] else 0
+            has_stop_line = 1 if l['has_stop_line'] else 0
+            has_traffic_lights = 1 if l['has_traffic_lights'] else 0
+            left_lane_type = l['left_lane_type']
+            right_lane_type = l['right_lane_type']
+            is_on_routing = 1 if l['is_on_routing'] else 0
+            traffic_ligth_status = -1
+            if l['traffic_ligth_status'] == 'green':
+                traffic_ligth_status = 1
+            elif l['traffic_ligth_status'] == 'red':
+                traffic_ligth_status = 0
+            else:
+                traffic_ligth_status = 2
+
+            sample = np.linspace(0, len(
+                l['path']) - 1,  num=50, endpoint=True, retstep=False, dtype=np.int32).tolist()
+            path = []
+            for i in sample:
+                path.append(l['path'][i])
+
+            atttrib = [left_width, right_width, max_speed, ego_on_lane, has_stop_line,
+                       has_traffic_lights, left_lane_type, right_lane_type, is_on_routing, traffic_ligth_status]
+            new_frame.append({'lane_atttrib': atttrib, 'path': path})
+        new_lanes.append(new_frame)
+    return new_lanes
+
+
+def process_agent(agents):
+    agents = agents[::-1]
+    key_frame = np.array(agents[0], dtype=object)
+    if len(key_frame) == 0:
+        return [np.zeros((10, 9)) for i in range(len(agents))]
+
+    key_agents_index = {}
+    for i, a in enumerate(key_frame):
+        key_agents_index[a[-1]] = i
+
+    obs_map = {'pedestrian': 0, 'vehicle': 1, 'bicycle': 2,
+               'traffic_cone': 3, 'barrier': 4, 'czone_sign': 5}
+    new_agents = []
+    for i, frame in enumerate(agents):
+        np_frame = np.array(frame, dtype=object)
+        if i == 0:
+            np_frame[:, -2] = [obs_map[i] for i in np_frame[:, -2]]
+            np_frame = np.insert(np_frame,  -1, values=1, axis=1)
+            new_agents.append(np_frame)
+            continue
+        if len(frame) == 0:
+            frame = copy.deepcopy(new_agents[-1])
+            frame[:, -2] = 0
+            new_agents.append(frame)
+            continue
+
+        np_frame[:, -2] = [obs_map[i] for i in np_frame[:, -2]]
+        np_frame = np.insert(np_frame,  -1, values=1, axis=1)
+
+        for token, idx in key_agents_index.items():
+            if token in np_frame[:-1]:
+                index = np.where(np_frame[:, -1] == token)[0].item()
+                np_frame[[index, idx]] = np_frame[[idx, index]]
+            else:
+                last_frame = copy.deepcopy(new_agents[-1])
+                index = np.where(last_frame[:, -1] == token)[0].item()
+                ag = last_frame[index]
+                ag[-2] = 0
+                if len(np_frame)-1 < idx:
+                    np_frame = np.insert(np_frame, -1, ag, axis=0)
+                else:
+                    np_frame[idx] = ag
+
+        new_agents.append(np_frame[:len(key_frame),])
+    res = []
+    for a in new_agents:
+        res.append(a[..., :-1])
+    return res[::-1]
+
+
+def fileter_fn(row):
+    ego = json.loads(row['ego'])
+    if len(ego) != 201:
+        return False
+
+    lanes = json.loads(row['maps'])
+    is_empty = True
+    for frame in lanes:
+        empty = len(frame) == 0
+        is_empty = is_empty and empty
+
+    return (not is_empty)
+
+
+def encode_data(row):
+    agents = json.loads(row['agents'])
+    agents = process_agent(agents)
+    lanes = json.loads(row['maps'])
+    lanes = process_maps(lanes)
+    ego = json.loads(row['ego'])
+    return {'agents': agents, 'lanes': lanes, 'ego': ego}
+
+
 class Quaternion(object):
 
     def __init__(self, w, x, y, z):

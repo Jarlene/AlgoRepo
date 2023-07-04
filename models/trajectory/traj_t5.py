@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.Layers import FeedForward, LayerNorm, RotaryEmbedding, SelfAttention, CrossAttention
+from layers.Layers import LayerNorm, RotaryEmbedding, SelfAttention, CrossAttention, MoERouterLayer
 from typing import Optional, Tuple, Dict
 from einops import rearrange, einsum
 from models.base import Base
@@ -10,6 +10,17 @@ import math
 from argparse import Namespace
 import copy
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
+from metric.planning_metrics import AverageDisplacementError, FinalDisplacementError, AverageHeadingError, FinalHeadingError
+
+
+def rotate_half(x):
+    x = rearrange(x, "... (j d) -> ... j d", j=2)
+    x1, x2 = x.unbind(dim=-2)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(pos, t):
+    return (t * pos.cos()) + (rotate_half(t) * pos.sin())
 
 
 class NewGELUActivation(nn.Module):
@@ -47,9 +58,9 @@ class T5LayerNorm(nn.Module):
 class T5DenseGatedActDense(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.wi_0 = nn.Linear(args.embed_dim, args.d_ff, bias=False)
-        self.wi_1 = nn.Linear(args.embed_dim, args.d_ff, bias=False)
-        self.wo = nn.Linear(args.d_ff, args.embed_dim, bias=False)
+        self.wi_0 = nn.Linear(args.hidden_size, args.d_ff, bias=False)
+        self.wi_1 = nn.Linear(args.hidden_size, args.d_ff, bias=False)
+        self.wo = nn.Linear(args.d_ff, args.hidden_size, bias=False)
         self.dropout = nn.Dropout(args.dropout_rate)
         self.act = NewGELUActivation()
 
@@ -66,7 +77,7 @@ class T5LayerFF(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.DenseReluDense = T5DenseGatedActDense(args)
-        self.layer_norm = T5LayerNorm(args.embed_dim)
+        self.layer_norm = T5LayerNorm(args.hidden_size)
         self.dropout = nn.Dropout(args.dropout_rate)
 
     def forward(self, hidden_states):
@@ -85,7 +96,14 @@ class T5Block(nn.Module):
         if self.is_decoder:
             self.layer.append(CrossAttention(args))
 
-        self.layer.append(T5LayerFF(args))
+        if args.use_moe:
+            ffn = T5LayerFF(args)
+            moe = MoERouterLayer(num_experts=args.num_experts, topk=args.topk, expert_capacity=args.expert_capacity,
+                                 hidden_size=args.hidden_size, router_jitter_noise=args.router_jitter_noise, expert=ffn)
+            self.layer.append(moe)
+        else:
+            ffn = T5LayerFF(args)
+            self.layer.append(ffn)
 
     def forward(
             self,
@@ -97,7 +115,7 @@ class T5Block(nn.Module):
             hidden_states = self.layer[1](
                 hidden_states, key_value)
 
-        hidden_states = self.layer[-1](hidden_states)
+        hidden_states, _ = self.layer[-1](hidden_states)
         return hidden_states
 
 
@@ -107,7 +125,7 @@ class T5Stack(nn.Module):
         self.is_decoder = args.is_decoder
         self.block = nn.ModuleList([T5Block(args)
                                    for i in range(args.num_layers)])
-        self.final_layer_norm = T5LayerNorm(args.embed_dim)
+        self.final_layer_norm = T5LayerNorm(args.hidden_size)
         self.dropout = nn.Dropout(args.dropout_rate)
 
     def forward(self,
@@ -133,13 +151,30 @@ class TrajT5Model(Base):
     def __init__(self, args: Namespace) -> None:
         super(TrajT5Model, self).__init__()
 
-        self.decoder_start_token = nn.Parameter(torch.rand(1))
+        self.ego_embedding = nn.Linear(
+            args.ego_attribs, args.hidden_size, bias=False)
+        self.agent_embedding = nn.Linear(
+            args.agent_attribs, args.hidden_size, bias=False)
 
-        self.ego_embed = nn.Linear(args.ego_attribs, args.embed_dim)
-        self.agent_embed = nn.Linear(args.agent_attribs, args.embed_dim)
-        # self.map_embed = nn.Linear()
-        self.self_atten = SelfAttention(args)
-        self.cross_attent = CrossAttention(args)
+        self.ego_decoder_start_token = nn.Parameter(
+            torch.rand(args.ego_attribs))
+        self.agents_decoder_start_token = nn.Parameter(
+            torch.rand(args.num_of_agents, args.agent_attribs))
+
+        if args.use_lane:
+            self.lanes_embedding = nn.Linear(
+                args.lanes_attribs, self.hidden_size, bias=False)
+            self.num_of_lanes = args.num_of_lanes
+        else:
+            self.num_of_lanes = 0
+
+        self.num_of_all = self.num_of_lanes + args.num_of_agents
+
+        self.ego_weight = nn.Parameter(torch.ones(
+            1, self.num_of_all + 1, args.hidden_size, args.hidden_size))
+
+        self.agent_weight = nn.Parameter(torch.ones(
+            args.num_of_agents, self.num_of_all + 1, args.hidden_size, args.hidden_size))
 
         encoder_config = copy.deepcopy(args)
         encoder_config.is_decoder = False
@@ -149,97 +184,159 @@ class TrajT5Model(Base):
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         self.decoder = T5Stack(decoder_config)
-        self.ln = LayerNorm(args.embed_dim)
-        self.ego_weight = nn.Parameter(torch.rand(
-            1, args.num_of_agent, args.embed_dim, args.embed_dim))
-        self.agent_weight = nn.Parameter(torch.rand(
-            args.num_of_agent, args.num_of_agent, args.embed_dim, args.embed_dim))
 
-        self.ego_output = nn.Linear(args.embed_dim, args.ego_attribs)
-        self.agent_output = nn.Linear(args.embed_dim, args.agent_attribs)
+        self.ln = LayerNorm(args.hidden_size)
+        self.ego_output = nn.Linear(args.hidden_size, args.ego_attribs)
+        self.agent_output = nn.Linear(args.hidden_size, args.agent_attribs)
 
         self.metrics = {'mae': MeanAbsoluteError(),
                         'mape': MeanAbsolutePercentageError(),
-                        'mse': MeanSquaredError()}
+                        'mse': MeanSquaredError(),
+                        'ade': AverageDisplacementError(),
+                        'fde': FinalDisplacementError(),
+                        'ahe': AverageHeadingError(),
+                        'fhe': FinalHeadingError()}
 
-    def shift_right(self, data: torch.Tensor):
+        self.rotary_emb = RotaryEmbedding(args.hidden_size)
+        self.register_buffer("pos_emb", None, persistent=False)
+
+    def shift_right(self, data: torch.Tensor, shift_data: torch.Tensor):
         shifted_input_ids = data.new_zeros(data.shape)
-        shifted_input_ids[..., 1:] = data[..., :-1].clone()
-        shifted_input_ids[..., 0] = self.decoder_start_token
+        shifted_input_ids[:, 1:, ...] = data[:, :-1, ...].clone()
+        shifted_input_ids[:, 0, ...] = shift_data
         return shifted_input_ids
 
+    def get_rotary_embedding(self, n, device):
+        if self.pos_emb is not None:
+            return self.pos_emb[:n]
+
+        pos_emb = self.rotary_emb(n, device=device)
+        self.register_buffer("pos_emb", pos_emb, persistent=False)
+        return pos_emb
+
     def forward(self,
-                ego_input: torch.Tensor,
-                agent_input: torch.Tensor,
-                ego_feature_output: Optional[torch.Tensor] = None,
-                agent_feature_output: Optional[torch.Tensor] = None,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        ego_input_embed = self.ego_embed(ego_input)
-        agent_input_embed = self.agent_embed(agent_input)
+                ego: torch.Tensor,
+                y_ego:  Optional[torch.Tensor] = None,
+                agents: Optional[torch.Tensor] = None,
+                y_agents: Optional[torch.Tensor] = None,
+                lanes: Optional[torch.Tensor] = None) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
 
-        ego_input_embed = self.self_atten(ego_input_embed)
-        agent_input_embed = self.self_atten(agent_input_embed)
+        b, n, device = ego.shape[0], ego.shape[1],  ego.device
+        ego = self.ego_embedding(ego)
+        pos_emb = self.get_rotary_embedding(n, device)
+        ego = apply_rotary_pos_emb(pos_emb, ego)
+        x = ego.unsqueeze(-2)  # [batch_size x length x 1 x dim]
 
-        x = self.cross_attent(ego_input_embed, agent_input_embed)
+        if agents is not None:
+            agents = self.agent_embedding(agents)
+            # [batch_size x length x num_of_agents x dim]
+            pos_emb = pos_emb.unsqueeze(1)
+            agents = apply_rotary_pos_emb(pos_emb, agents)
+            x = torch.cat([x, agents], dim=-2)
 
+        if lanes is not None:
+            lanes = self.lanes_embedding(lanes)
+            # [batch_size x length x num_of_lanes x dim]
+            if pos_emb.dim() != 3:
+                pos_emb = pos_emb.unsqueeze(1)
+            lanes = apply_rotary_pos_emb(pos_emb, lanes)
+            x = torch.cat([x, lanes], dim=-2)
+
+        # [batch_size x length x (num_of_lanes +num_of_agents +1) x dim]
         encoder_output = self.encoder(x)
 
         ego_out = None
-        if ego_feature_output is not None:
-            ego_feature_output = self.shift_right(ego_feature_output)
-            ego_feature_output = self.ego_embed(ego_feature_output)
-            ego_out = self.decoder(ego_feature_output, encoder_output)
-            ego_out = self.ln(ego_out)
-            ego_out = einsum(ego_out, self.ego_weight,
-                             "b n s d, a s d d -> b n a d",)
+        if y_ego is not None and y_agents is not None:
+            y_ego = self.shift_right(y_ego, self.ego_decoder_start_token)
+            y_ego = self.ego_embedding(y_ego)
+            y_ego = y_ego.unsqueeze(-2)
+            y_agents = self.shift_right(
+                y_agents, self.agents_decoder_start_token)
+            y_agents = self.agent_embedding(y_agents)
+            x = torch.cat([y_ego, y_agents], dim=-2)
 
+            if lanes is not None:
+                n = x.shape[1]
+                lanes = lanes[:, -1, ...]
+                lanes = self.lanes_embedding(lanes).unsqueeze(1)
+                lanes = lanes.repeat(1, n, 1, 1)
+                x = torch.cat([x, lanes], dim=-2)
+        elif y_ego is not None and y_agents is None:
+            y_ego = self.shift_right(y_ego, self.ego_decoder_start_token)
+            y_ego = self.ego_embedding(y_ego)
+            x = y_ego.unsqueeze(-2)
+            if lanes is not None:
+                n = x.shape[1]
+                lanes = lanes[:, -1, ...]
+                lanes = self.lanes_embedding(lanes).unsqueeze(1)
+                lanes = lanes.repeat(1, n, 1, 1)
+                x = torch.cat([x, lanes], dim=-2)
+
+        ego_out = self.decoder(x, encoder_output)
+        output = self.ln(ego_out)
+
+        if agents is None and lanes is None:
+            ego_out = self.ego_output(output.squeeze(-2))
+        elif agents is not None and lanes is None:
+            diff = self.ego_weight.shape[1] - self.num_of_lanes + 1
+            ego_out = einsum(
+                output, self.ego_weight[:, :diff, :, :], "b n s d, a s d d -> b n a d")
+            ego_out = self.ego_output(ego_out).squeeze(-2)
+        elif agents is None and lanes is not None:
+            diff = self.num_of_lanes + 1
+            ego_out = einsum(
+                output, self.ego_weight[:, :diff, :, :], "b n s d, a s d d -> b n a d")
+            ego_out = self.ego_output(ego_out).squeeze(-2)
+        else:
+            ego_out = einsum(output, self.ego_weight,
+                             "b n s d, a s d d -> b n a d")
             # [batch_size x length x  ego_attribs]
             ego_out = self.ego_output(ego_out).squeeze(-2)
 
         agent_out = None
-        if agent_feature_output is not None:
-            agent_feature_output = self.shift_right(agent_feature_output)
-            agent_feature_output = self.agent_embed(agent_feature_output)
-            agent_out = self.decoder(agent_feature_output, encoder_output)
-            agent_out = self.ln(agent_out)
-            agent_out = einsum(agent_out, self.agent_weight,
-                               "b n s d, a s d d -> b n a d",)
+        if y_agents is not None and agents is not None:
+            if lanes is None:
+                diff = self.ego_weight.shape[1] - self.num_of_lanes + 1
+                agent_out = einsum(output, self.agent_weight[:, :diff, :, :],
+                                   "b n s d, a s d d -> b n a d")
+            else:
+                agent_out = einsum(output, self.agent_weight,
+                                   "b n s d, a s d d -> b n a d")
 
-            # [batch_size x length x num_of_agent x agent_attribs]
+                # [batch_size x length x num_of_agent x agent_attribs]
             agent_out = self.agent_output(agent_out)
 
         return ego_out, agent_out
 
     def loss(self,
-             ego_input: torch.Tensor,
-             agent_input: torch.Tensor,
-             ego_feature_output: Optional[torch.Tensor] = None,
-             agent_feature_output: Optional[torch.Tensor] = None):
-        ego_logits, agent_logits, = self.forward(
-            ego_input, agent_input, ego_feature_output, agent_feature_output)
+             ego: torch.Tensor,
+             y_ego:  Optional[torch.Tensor] = None,
+             agents: Optional[torch.Tensor] = None,
+             y_agents: Optional[torch.Tensor] = None,
+             lanes: Optional[torch.Tensor] = None):
+        ego_logits, agent_logits = self.forward(
+            ego, y_ego, agents, y_agents, lanes)
         loss = 0.0
-        if ego_feature_output is not None and ego_logits is not None:
-            ego_loss = F.mse_loss(ego_logits, ego_feature_output)
-            loss += ego_loss
-        if agent_feature_output is not None and agent_logits is not None:
-            agent_loss = F.mse_loss(agent_logits, agent_feature_output)
-            loss += agent_loss
+        if y_ego is not None:
+            loss = F.mse_loss(ego_logits, y_ego)
+        if agents is not None and y_agents is not None:
+            loss += F.mse_loss(agent_logits, y_agents)
         return loss
 
     def metric(self,
-               ego_input: torch.Tensor,
-               agent_input: torch.Tensor,
-               ego_feature_output: Optional[torch.Tensor] = None,
-               agent_feature_output: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+               ego: torch.Tensor,
+               y_ego:  Optional[torch.Tensor] = None,
+               agents: Optional[torch.Tensor] = None,
+               y_agents: Optional[torch.Tensor] = None,
+               lanes: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
 
         res = {}
         ego_logits, agent_logits = self.forward(
-            ego_input, agent_input, ego_feature_output, agent_feature_output)
+            ego, y_ego, agents, y_agents, lanes)
         for k, m in self.metrics.items():
-            m.to(ego_input.device)
-            m.update(ego_logits, ego_feature_output)
-            m.update(agent_logits, agent_feature_output)
+            m.to(ego.device)
+            m.update(ego_logits, y_ego)
             res[k] = m.compute()
-
         return res
 
     def reset(self):
