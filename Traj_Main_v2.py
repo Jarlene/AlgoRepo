@@ -25,8 +25,7 @@ def get_args():
     args.d_ff = 512
     args.dropout_rate = 0.5
     args.is_decoder = True
-    args.num_layers = 8
-    args.num_heads = 8
+
     args.train_file = '/home/jarlene/Code/Projects/Experiment/data/traj/traj.pt'
 
     args.ego_attribs = 7

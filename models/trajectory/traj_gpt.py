@@ -246,12 +246,15 @@ class TrajGPT(Base):
             diff = self.ego_weight.shape[2] - self.num_of_lanes
             ego_out = einsum("b n s d, a s d d -> b n a d",
                              x, self.ego_weight[:, :, :diff, :])
+            ego_out = self.ego_proj(ego_out.squeeze(-2))
             angent_out = einsum(
                 "b n s d, a s d d -> b n a d", x, self.agent_weight[:, :, :diff, :])
+            angent_out = self.agent_proj(angent_out)
         elif agents is None and lanes is not None:
             diff = self.num_of_lanes + 1
             ego_out = einsum("b n s d, a s d d -> b n a d",
                              x, self.ego_weight[:, :, :diff, :])
+            ego_out = self.ego_proj(ego_out.squeeze(-2))
             angent_out = None
         else:
             ego_out = einsum("b n s d, a s d d -> b n a d", x, self.ego_weight)

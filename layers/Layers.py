@@ -1021,12 +1021,12 @@ class MoE(nn.Module):
 
 class SelfAttention(nn.Module):
 
-    def __init__(self, args: Namespace) -> None:
+    def __init__(self, hidden_size, num_heads, split_head=True) -> None:
         super(SelfAttention, self).__init__()
-        self.split_head = args.split_head
-        self.hidden_size = args.hidden_size
+        self.split_head = split_head
+        self.hidden_size = hidden_size
         if self.split_head:
-            self.num_heads = args.num_heads
+            self.num_heads = num_heads
             self.head_dim = self.hidden_size//self.num_heads
 
         self.norm = LayerNorm(self.hidden_size)
@@ -1079,12 +1079,12 @@ class SelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, args: Namespace) -> None:
+    def __init__(self, hidden_size, num_heads, split_head=True) -> None:
         super(CrossAttention, self).__init__()
-        self.hidden_size = args.hidden_size
-        self.split_head = args.split_head
+        self.hidden_size = hidden_size
+        self.split_head = split_head
         if self.split_head:
-            self.num_heads = args.num_heads
+            self.num_heads = num_heads
             self.head_dim = self.hidden_size//self.num_heads
 
         self.norm = LayerNorm(self.hidden_size)
@@ -1148,48 +1148,48 @@ class Transpose(nn.Module):
 
 
 class DualAttenion(nn.Module):
-    def __init__(self, args: Namespace, over_channel=False):
+    def __init__(self, hidden_size, enc_in, num_heads, dropout, momentum, d_ff, dp_rank, total_token_number, alpha, over_channel=False):
         super(DualAttenion, self).__init__()
         self.over_channel = over_channel
-        self.num_heads = args.num_heads
-        self.c_in = args.enc_in
+        self.num_heads = num_heads
+        self.c_in = enc_in
         # attention related
-        self.qkv = nn.Linear(args.hidden_size, args.hidden_size * 3, bias=True)
-        self.attn_dropout = nn.Dropout(args.dropout)
-        self.head_dim = args.hidden_size // args.num_heads
-        self.dropout_mlp = nn.Dropout(args.dropout)
-        self.mlp = nn.Linear(args.hidden_size, args.hidden_size)
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.head_dim = hidden_size // num_heads
+        self.dropout_mlp = nn.Dropout(dropout)
+        self.mlp = nn.Linear(hidden_size, hidden_size)
         self.norm_post1 = nn.Sequential(Transpose(1, 2),
-                                        nn.BatchNorm1d(args.hidden_size,
-                                                       momentum=args.momentum),
+                                        nn.BatchNorm1d(hidden_size,
+                                                       momentum=momentum),
                                         Transpose(1, 2))
         self.norm_post2 = nn.Sequential(Transpose(1, 2),
-                                        nn.BatchNorm1d(args.hidden_size,
-                                                       momentum=args.momentum),
+                                        nn.BatchNorm1d(hidden_size,
+                                                       momentum=momentum),
                                         Transpose(1, 2))
         self.norm_attn = nn.Sequential(Transpose(1, 2),
-                                       nn.BatchNorm1d(args.hidden_size,
-                                                      momentum=args.momentum),
+                                       nn.BatchNorm1d(hidden_size,
+                                                      momentum=momentum),
                                        Transpose(1, 2))
-        self.ff_1 = nn.Sequential(nn.Linear(args.hidden_size, args.d_ff, bias=True),
+        self.ff_1 = nn.Sequential(nn.Linear(hidden_size, d_ff, bias=True),
                                   nn.GELU(),
-                                  nn.Dropout(args.dropout),
-                                  nn.Linear(args.d_ff, args.hidden_size, bias=True))
-        self.ff_2 = nn.Sequential(nn.Linear(args.hidden_size, args.d_ff, bias=True),
+                                  nn.Dropout(dropout),
+                                  nn.Linear(d_ff, hidden_size, bias=True))
+        self.ff_2 = nn.Sequential(nn.Linear(hidden_size, d_ff, bias=True),
                                   nn.GELU(),
-                                  nn.Dropout(args.dropout),
-                                  nn.Linear(args.d_ff, args.hidden_size, bias=True))
+                                  nn.Dropout(dropout),
+                                  nn.Linear(d_ff, hidden_size, bias=True))
 
         # dynamic projection related
-        self.dp_rank = args.dp_rank
+        self.dp_rank = dp_rank
         self.dp_k = nn.Linear(self.head_dim, self.dp_rank)
         self.dp_v = nn.Linear(self.head_dim, self.dp_rank)
         # EMA related
-        ema_size = max(args.enc_in, args.total_token_number, args.dp_rank)
+        ema_size = max(enc_in, total_token_number, dp_rank)
         ema_matrix = torch.zeros((ema_size, ema_size))
-        alpha = args.alpha
+        alpha = alpha
         ema_matrix[0][0] = 1
-        for i in range(1, args.total_token_number):
+        for i in range(1, total_token_number):
             for j in range(i):
                 ema_matrix[i][j] = ema_matrix[i-1][j]*(1-alpha)
             ema_matrix[i][i] = alpha

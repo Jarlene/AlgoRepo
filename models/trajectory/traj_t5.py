@@ -92,9 +92,11 @@ class T5Block(nn.Module):
         super(T5Block, self).__init__()
         self.is_decoder = args.is_decoder
         self.layer = nn.ModuleList()
-        self.layer.append(SelfAttention(args))
+        self.layer.append(SelfAttention(hidden_size=args.hidden_size,
+                          num_heads=args.num_heads, split_head=args.split_head))
         if self.is_decoder:
-            self.layer.append(CrossAttention(args))
+            self.layer.append(CrossAttention(hidden_size=args.hidden_size,
+                                             num_heads=args.num_heads, split_head=args.split_head))
 
         if args.use_moe:
             ffn = T5LayerFF(args)

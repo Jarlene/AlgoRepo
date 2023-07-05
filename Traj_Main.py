@@ -61,8 +61,7 @@ def collate(batch):
     agent_x = torch.stack(agent_xs)
     ego_y = torch.stack(ego_ys)
     agent_y = torch.stack(agent_ys)
-
-    return {"feature": (ego_x, agent_x), "target": (ego_y, agent_y)}
+    return {"ego": ego_x, "agents": agent_x, "y_ego": ego_y, "y_agents": agent_y}
 
 
 def main():
@@ -79,8 +78,9 @@ def main():
                        pin_memory=args.pin_memory,
                        collate_fn=collate)
     model = get_model(args)
-    ego_x, agent_x = train_dataset[0]['feature']
-    example = (ego_x.unsqueeze(0), agent_x.unsqueeze(0))
+    example = collate([train_dataset[0], train_dataset[1]])
+    example.pop('y_ego')
+    example.pop('y_agents')
     wrap = Wrap(model, args, example)
     trainer.fit(model=wrap, datamodule=data,
                 ckpt_path='last' if args.resume else None)
