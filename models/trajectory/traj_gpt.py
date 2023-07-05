@@ -150,22 +150,31 @@ class TrajGPT(Base):
         self.embed_dim = args.hidden_size
         self.ego_embedding = nn.Linear(
             args.ego_attribs, self.embed_dim, bias=False)
-        self.agent_embedding = nn.Linear(
-            args.agent_attribs, self.embed_dim, bias=False)
 
-        if args.use_lane:
+        if args.use_agents:
+            self.agent_embedding = nn.Linear(
+                args.agent_attribs, self.embed_dim, bias=False)
+            self.num_of_agents = args.num_of_agents
+        else:
+            self.num_of_agents = 0
+
+        if args.use_lanes:
             self.lanes_embedding = nn.Linear(
-                args.num_of_lane_path_point * 3 + args.lanes_attribs, self.embed_dim, bias=False)
+                args.lanes_attribs, self.embed_dim, bias=False)
             self.num_of_lanes = args.num_of_lanes
         else:
             self.num_of_lanes = 0
 
-        self.num_of_all = self.num_of_lanes + args.num_of_agents
-        self.ego_weight = nn.Parameter(torch.ones(
-            1, self.num_of_all + 1, args.hidden_size, args.hidden_size))
+        self.num_of_all = self.num_of_lanes + self.num_of_agents
 
-        self.agent_weight = nn.Parameter(torch.ones(
-            args.num_of_agents, self.num_of_all + 1, args.hidden_size, args.hidden_size))
+        if args.use_agents or args.use_lanes:
+            self.ego_weight = nn.Parameter(torch.ones(
+                1, self.num_of_all + 1, args.hidden_size, args.hidden_size))
+
+        if args.use_agents:
+            self.agent_weight = nn.Parameter(torch.ones(
+                args.num_of_agents, self.num_of_all + 1, args.hidden_size, args.hidden_size))
+            self.agent_proj = nn.Linear(args.hidden_size, args.agent_attribs)
 
         self.drop = nn.Dropout(args.embd_pdrop)
         self.h = nn.ModuleList([Block(args, layer_idx=i)
@@ -173,7 +182,6 @@ class TrajGPT(Base):
         self.rotary_emb = RotaryEmbedding(self.embed_dim)
         self.ln = LayerNorm(self.embed_dim)
         self.ego_proj = nn.Linear(args.hidden_size, args.ego_attribs)
-        self.agent_proj = nn.Linear(args.hidden_size, args.agent_attribs)
 
         self.register_buffer("pos_emb", None, persistent=False)
         self.register_buffer("mask", None, persistent=False)
@@ -236,31 +244,19 @@ class TrajGPT(Base):
             hidden_states, attn_outputs = block(
                 hidden_states=hidden_states, attention_mask=attention_mask)
             atten_outputs.append(attn_outputs)
+        # [batch_size x length x (num_of_lanes + num_of_agents +1) x dim]
         x = self.ln(hidden_states)
 
-        # [batch_size x length x (num_of_lanes + num_of_agents +1) x dim]
+        angent_out = None
         if agents is None and lanes is None:
             ego_out = self.ego_proj(x.squeeze(-2))
-            angent_out = None
-        elif agents is not None and lanes is None:
-            diff = self.ego_weight.shape[2] - self.num_of_lanes
-            ego_out = einsum("b n s d, a s d d -> b n a d",
-                             x, self.ego_weight[:, :, :diff, :])
-            ego_out = self.ego_proj(ego_out.squeeze(-2))
-            angent_out = einsum(
-                "b n s d, a s d d -> b n a d", x, self.agent_weight[:, :, :diff, :])
-            angent_out = self.agent_proj(angent_out)
-        elif agents is None and lanes is not None:
-            diff = self.num_of_lanes + 1
-            ego_out = einsum("b n s d, a s d d -> b n a d",
-                             x, self.ego_weight[:, :, :diff, :])
-            ego_out = self.ego_proj(ego_out.squeeze(-2))
-            angent_out = None
         else:
             ego_out = einsum("b n s d, a s d d -> b n a d", x, self.ego_weight)
-            angent_out = einsum(
-                "b n s d, a s d d -> b n a d", x, self.agent_weight)
-            angent_out = self.agent_proj(angent_out)
+            ego_out = self.ego_proj(ego_out.squeeze(-2))
+            if agents is not None:
+                angent_out = einsum(
+                    "b n s d, a s d d -> b n a d", x, self.agent_weight)
+                angent_out = self.agent_proj(angent_out)
         return ego_out, angent_out
 
     def loss(self,

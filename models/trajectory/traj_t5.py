@@ -152,31 +152,37 @@ class T5Stack(nn.Module):
 class TrajT5Model(Base):
     def __init__(self, args: Namespace) -> None:
         super(TrajT5Model, self).__init__()
-
         self.ego_embedding = nn.Linear(
             args.ego_attribs, args.hidden_size, bias=False)
-        self.agent_embedding = nn.Linear(
-            args.agent_attribs, args.hidden_size, bias=False)
-
         self.ego_decoder_start_token = nn.Parameter(
             torch.rand(args.ego_attribs))
-        self.agents_decoder_start_token = nn.Parameter(
-            torch.rand(args.num_of_agents, args.agent_attribs))
 
-        if args.use_lane:
+        if args.use_agents:
+            self.agent_embedding = nn.Linear(
+                args.agent_attribs, self.embed_dim, bias=False)
+            self.num_of_agents = args.num_of_agents
+            self.agents_decoder_start_token = nn.Parameter(
+                torch.rand(self.num_of_agents, args.agent_attribs))
+        else:
+            self.num_of_agents = 0
+
+        if args.use_lanes:
             self.lanes_embedding = nn.Linear(
-                args.lanes_attribs, self.hidden_size, bias=False)
+                args.lanes_attribs, self.embed_dim, bias=False)
             self.num_of_lanes = args.num_of_lanes
         else:
             self.num_of_lanes = 0
 
-        self.num_of_all = self.num_of_lanes + args.num_of_agents
+        self.num_of_all = self.num_of_lanes + self.num_of_agents
 
-        self.ego_weight = nn.Parameter(torch.ones(
-            1, self.num_of_all + 1, args.hidden_size, args.hidden_size))
+        if args.use_agents or args.use_lanes:
+            self.ego_weight = nn.Parameter(torch.ones(
+                1, self.num_of_all + 1, args.hidden_size, args.hidden_size))
 
-        self.agent_weight = nn.Parameter(torch.ones(
-            args.num_of_agents, self.num_of_all + 1, args.hidden_size, args.hidden_size))
+        if args.use_agents:
+            self.agent_weight = nn.Parameter(torch.ones(
+                args.num_of_agents, self.num_of_all + 1, args.hidden_size, args.hidden_size))
+            self.agent_proj = nn.Linear(args.hidden_size, args.agent_attribs)
 
         encoder_config = copy.deepcopy(args)
         encoder_config.is_decoder = False
@@ -218,7 +224,7 @@ class TrajT5Model(Base):
 
     def forward(self,
                 ego: torch.Tensor,
-                y_ego:  Optional[torch.Tensor] = None,
+                y_ego:  torch.Tensor,
                 agents: Optional[torch.Tensor] = None,
                 y_agents: Optional[torch.Tensor] = None,
                 lanes: Optional[torch.Tensor] = None) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -232,11 +238,13 @@ class TrajT5Model(Base):
         if agents is not None:
             agents = self.agent_embedding(agents)
             # [batch_size x length x num_of_agents x dim]
-            pos_emb = pos_emb.unsqueeze(1)
+            if pos_emb.dim() != 3:
+                pos_emb = pos_emb.unsqueeze(1)
             agents = apply_rotary_pos_emb(pos_emb, agents)
             x = torch.cat([x, agents], dim=-2)
 
         if lanes is not None:
+            lanes = lanes.view(b, n, self.num_of_lanes, -1)
             lanes = self.lanes_embedding(lanes)
             # [batch_size x length x num_of_lanes x dim]
             if pos_emb.dim() != 3:
@@ -247,66 +255,43 @@ class TrajT5Model(Base):
         # [batch_size x length x (num_of_lanes +num_of_agents +1) x dim]
         encoder_output = self.encoder(x)
 
-        ego_out = None
-        if y_ego is not None and y_agents is not None:
-            y_ego = self.shift_right(y_ego, self.ego_decoder_start_token)
-            y_ego = self.ego_embedding(y_ego)
-            y_ego = y_ego.unsqueeze(-2)
+        y_ego = self.shift_right(y_ego, self.ego_decoder_start_token)
+        y_ego = self.ego_embedding(y_ego)
+        y_pos_emb = self.get_rotary_embedding(y_ego.shape[1], device)
+        y_ego = apply_rotary_pos_emb(y_pos_emb, y_ego)
+        x = y_ego.unsqueeze(-2)
+        if y_agents is not None:
             y_agents = self.shift_right(
                 y_agents, self.agents_decoder_start_token)
             y_agents = self.agent_embedding(y_agents)
-            x = torch.cat([y_ego, y_agents], dim=-2)
+            if y_pos_emb.dim() != 3:
+                y_pos_emb = y_pos_emb.unsqueeze(1)
+            y_agents = apply_rotary_pos_emb(y_pos_emb, y_agents)
+            x = torch.cat([x, y_agents], dim=-2)
 
-            if lanes is not None:
-                n = x.shape[1]
-                lanes = lanes[:, -1, ...]
-                lanes = self.lanes_embedding(lanes).unsqueeze(1)
-                lanes = lanes.repeat(1, n, 1, 1)
-                x = torch.cat([x, lanes], dim=-2)
-        elif y_ego is not None and y_agents is None:
-            y_ego = self.shift_right(y_ego, self.ego_decoder_start_token)
-            y_ego = self.ego_embedding(y_ego)
-            x = y_ego.unsqueeze(-2)
-            if lanes is not None:
-                n = x.shape[1]
-                lanes = lanes[:, -1, ...]
-                lanes = self.lanes_embedding(lanes).unsqueeze(1)
-                lanes = lanes.repeat(1, n, 1, 1)
-                x = torch.cat([x, lanes], dim=-2)
+        if lanes is not None:
+            n = x.shape[1]
+            lanes = lanes[:, -1, ...]
+            lanes = self.lanes_embedding(lanes).unsqueeze(1)
+            lanes = lanes.repeat(1, n, 1, 1)
+            x = torch.cat([x, lanes], dim=-2)
 
-        ego_out = self.decoder(x, encoder_output)
-        output = self.ln(ego_out)
+        output = self.decoder(x, encoder_output)
+        output = self.ln(output)
+
+        ego_out = None
+        agent_out = None
 
         if agents is None and lanes is None:
             ego_out = self.ego_output(output.squeeze(-2))
-        elif agents is not None and lanes is None:
-            diff = self.ego_weight.shape[1] - self.num_of_lanes + 1
-            ego_out = einsum(
-                output, self.ego_weight[:, :diff, :, :], "b n s d, a s d d -> b n a d")
-            ego_out = self.ego_output(ego_out).squeeze(-2)
-        elif agents is None and lanes is not None:
-            diff = self.num_of_lanes + 1
-            ego_out = einsum(
-                output, self.ego_weight[:, :diff, :, :], "b n s d, a s d d -> b n a d")
-            ego_out = self.ego_output(ego_out).squeeze(-2)
         else:
             ego_out = einsum(output, self.ego_weight,
                              "b n s d, a s d d -> b n a d")
-            # [batch_size x length x  ego_attribs]
             ego_out = self.ego_output(ego_out).squeeze(-2)
-
-        agent_out = None
-        if y_agents is not None and agents is not None:
-            if lanes is None:
-                diff = self.ego_weight.shape[1] - self.num_of_lanes + 1
-                agent_out = einsum(output, self.agent_weight[:, :diff, :, :],
-                                   "b n s d, a s d d -> b n a d")
-            else:
+            if agents is not None:
                 agent_out = einsum(output, self.agent_weight,
                                    "b n s d, a s d d -> b n a d")
-
-                # [batch_size x length x num_of_agent x agent_attribs]
-            agent_out = self.agent_output(agent_out)
+                agent_out = self.agent_output(agent_out)
 
         return ego_out, agent_out
 
