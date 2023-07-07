@@ -3,16 +3,17 @@ from argparse import Namespace
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR, CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data import random_split
-from typing import List, Union, Any, Optional, Dict
+from typing import Union, Any, Dict
+from transformers.training_args import TrainingArguments
 from models.base import Base
 from lightning.pytorch.core import LightningModule, LightningDataModule
 from lightning.pytorch.trainer import Trainer
-from lightning.pytorch.profilers import PyTorchProfiler
-from lightning.pytorch.plugins.environments import TorchElasticEnvironment, LightningEnvironment, SLURMEnvironment, MPIEnvironment
+from lightning.pytorch.plugins.environments import TorchElasticEnvironment
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.plugins import TorchCheckpointIO
 from lightning.pytorch.callbacks import (
@@ -21,12 +22,9 @@ from lightning.pytorch.callbacks import (
     EarlyStopping,
     GradientAccumulationScheduler,
     ModelSummary,
-    TQDMProgressBar,
-    DeviceStatsMonitor
+    TQDMProgressBar
 )
-
-from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin, FullyShardedDataParallelPlugin, MegatronLMPlugin
+import transformers.trainer as trainer
 
 
 class Wrap(LightningModule):
@@ -239,23 +237,51 @@ def get_train_args():
     return args
 
 
-def getAccelerator(args):
+class HTrainer(trainer.Trainer):
 
-    if args.use_deepspeed:
-        deepspeed = DeepSpeedPlugin()
-        deepspeed.gradient_accumulation_steps = args.gradient_accumulation_steps
-        deepspeed.zero_stage = args.zero_stage
-    if args.use_fsdp:
-        fsdp = FullyShardedDataParallelPlugin()
-    if args.use_megatron:
-        megatron = MegatronLMPlugin()
+    def __init__(self, model: Base, args: TrainingArguments, train_dataset: Dataset, collate_fn: Any | None = None,  eval_dataset: Dataset = None, **kwargs):
+        super().__init__(model=model, args=args, data_collator=collate_fn,
+                         train_dataset=train_dataset, eval_dataset=eval_dataset, **kwargs)
 
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        log_with='tensorboard',
-        logging_dir=os.path.join(args.log_dir, args.name, args.version),
-        deepspeed_plugin=deepspeed,
-        fsdp_plugin=fsdp,
-        megatron_lm_plugin=megatron,
-    )
-    accelerator.init_trackers(project_name="")
+    def compute_loss(self, model, inputs, return_outputs=False):
+        if hasattr(model, "module"):
+            return model.module.loss(**inputs)
+        else:
+            return model.loss(**inputs)
+
+    # def training_step(self, model, inputs):
+    #     print(self.args.device)
+    #     loss = super().training_step(model, inputs)
+    #     if hasattr(model, "module"):
+    #         metrics = model.module.metric(**inputs)
+    #     else:
+    #         metrics = model.metric(**inputs)
+    #     if len(metrics) > 0:
+    #         res = {}
+    #         for k, v in metrics.items():
+    #             res["train_" + k] = v.detach().cpu().item()
+    #         self.log(res)
+    #     return loss
+
+    # def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys):
+    #     result = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+    #     if hasattr(model, "module"):
+    #         model.module.reset()
+    #         metrics = model.module.metric(**inputs)
+    #     else:
+    #         model.reset()
+    #         metrics = model.metric(**inputs)
+
+    #     if len(metrics) > 0:
+    #         res = {}
+    #         for k, v in metrics.items():
+    #             res["pred_"+k] = v.detach().cpu().item()
+    #         self.log(res)
+    #     return result
+
+
+def get_transformers_trainer(args: TrainingArguments, model: nn.Module, train_dataset: Dataset, eval_dataset: Dataset = None, collate_fn=None):
+    args.remove_unused_columns = False
+    h_trainer = HTrainer(
+        model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, collate_fn=collate_fn)
+    return h_trainer
