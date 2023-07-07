@@ -1,8 +1,9 @@
 import torch
 
-from dataset.nuplan import NuPlanDataSetT5
-from models.wrap import AutoDateSet, Wrap, get_trainer, get_train_args
+from dataset.nuplan import NuPlanDataSetGPT
+from models.wrap import AutoDateSet, Wrap, get_trainer, get_train_args, get_transformers_trainer
 from models.trajectory.traj_gpt import TrajGPT
+from transformers import TrainingArguments, HfArgumentParser
 
 
 def get_model(args):
@@ -12,7 +13,7 @@ def get_model(args):
 
 def get_data(args):
     data = torch.load(args.train_file)
-    train_dataset = NuPlanDataSetT5(data)
+    train_dataset = NuPlanDataSetGPT(data)
     return train_dataset
 
 
@@ -34,7 +35,8 @@ def get_args():
     args.ego_attribs = 7
     args.agent_attribs = 8
     args.num_of_agents = 80
-    args.use_lane = False
+    args.use_lanes = False
+    args.use_agents = True
     # moe
     args.use_moe = True
     args.num_experts = 100
@@ -81,10 +83,23 @@ def main():
     example = collate([train_dataset[0], train_dataset[1]])
     example.pop('y_ego')
     example.pop('y_agents')
-    wrap = Wrap(model, args, example)
+    wrap = Wrap(model, args, tuple(example.values()))
     trainer.fit(model=wrap, datamodule=data,
                 ckpt_path='last' if args.resume else None)
 
 
+def h_trainer():
+    args = get_args()
+    train_dataset = get_data(args)
+    model = get_model(args)
+    parser = HfArgumentParser(TrainingArguments)
+    training_args: TrainingArguments = parser.parse_args_into_dataclasses()[0]
+    training_args.remove_unused_columns = False
+    trainer = get_transformers_trainer(
+        training_args, model=model, train_dataset=train_dataset, collate_fn=collate)
+
+    trainer.train()
+
+
 if __name__ == "__main__":
-    main()
+    h_trainer()

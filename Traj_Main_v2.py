@@ -25,13 +25,15 @@ def get_args():
     args.d_ff = 512
     args.dropout_rate = 0.5
     args.is_decoder = True
-
+    args.num_layers = 6
+    args.num_heads = 8
     args.train_file = '/home/jarlene/Code/Projects/Experiment/data/traj/traj.pt'
 
     args.ego_attribs = 7
     args.agent_attribs = 8
     args.num_of_agents = 80
-    args.use_lane = False
+    args.use_lanes = False
+    args.use_agents = True
     # moe
     args.use_moe = True
     args.num_experts = 100
@@ -77,7 +79,8 @@ def main():
                        collate_fn=collate)
     model = get_model(args)
     example = collate([train_dataset[0], train_dataset[1]])
-    wrap = Wrap(model, args, example)
+    wrap = Wrap(
+        model, args, (example['ego'], example['y_ego'], example['agents'], example['y_agents']))
     trainer.fit(model=wrap, datamodule=data,
                 ckpt_path='last' if args.resume else None)
 

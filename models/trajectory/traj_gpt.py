@@ -147,20 +147,19 @@ class TrajGPT(Base):
     def __init__(self, args) -> None:
         super().__init__()
         self.args = args
-        self.embed_dim = args.hidden_size
         self.ego_embedding = nn.Linear(
-            args.ego_attribs, self.embed_dim, bias=False)
+            args.ego_attribs, args.hidden_size, bias=False)
 
         if args.use_agents:
             self.agent_embedding = nn.Linear(
-                args.agent_attribs, self.embed_dim, bias=False)
+                args.agent_attribs, args.hidden_size, bias=False)
             self.num_of_agents = args.num_of_agents
         else:
             self.num_of_agents = 0
 
         if args.use_lanes:
             self.lanes_embedding = nn.Linear(
-                args.lanes_attribs, self.embed_dim, bias=False)
+                args.lanes_attribs, args.hidden_size, bias=False)
             self.num_of_lanes = args.num_of_lanes
         else:
             self.num_of_lanes = 0
@@ -179,8 +178,8 @@ class TrajGPT(Base):
         self.drop = nn.Dropout(args.embd_pdrop)
         self.h = nn.ModuleList([Block(args, layer_idx=i)
                                for i in range(args.num_hidden_layers)])
-        self.rotary_emb = RotaryEmbedding(self.embed_dim)
-        self.ln = LayerNorm(self.embed_dim)
+        self.rotary_emb = RotaryEmbedding(args.hidden_size)
+        self.ln = LayerNorm(args.hidden_size)
         self.ego_proj = nn.Linear(args.hidden_size, args.ego_attribs)
 
         self.register_buffer("pos_emb", None, persistent=False)
@@ -195,7 +194,8 @@ class TrajGPT(Base):
 
     def get_rotary_embedding(self, n, device):
         if self.pos_emb is not None:
-            return self.pos_emb[:n]
+            if self.pos_emb.size(-2) >= n:
+                return self.pos_emb[:n]
 
         pos_emb = self.rotary_emb(n, device=device)
         self.register_buffer("pos_emb", pos_emb, persistent=False)

@@ -159,7 +159,7 @@ class TrajT5Model(Base):
 
         if args.use_agents:
             self.agent_embedding = nn.Linear(
-                args.agent_attribs, self.embed_dim, bias=False)
+                args.agent_attribs, args.hidden_size, bias=False)
             self.num_of_agents = args.num_of_agents
             self.agents_decoder_start_token = nn.Parameter(
                 torch.rand(self.num_of_agents, args.agent_attribs))
@@ -168,7 +168,7 @@ class TrajT5Model(Base):
 
         if args.use_lanes:
             self.lanes_embedding = nn.Linear(
-                args.lanes_attribs, self.embed_dim, bias=False)
+                args.lanes_attribs, args.hidden_size, bias=False)
             self.num_of_lanes = args.num_of_lanes
         else:
             self.num_of_lanes = 0
@@ -216,7 +216,8 @@ class TrajT5Model(Base):
 
     def get_rotary_embedding(self, n, device):
         if self.pos_emb is not None:
-            return self.pos_emb[:n]
+            if self.pos_emb.size(-2) >= n:
+                return self.pos_emb[:n]
 
         pos_emb = self.rotary_emb(n, device=device)
         self.register_buffer("pos_emb", pos_emb, persistent=False)

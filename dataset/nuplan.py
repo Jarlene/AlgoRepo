@@ -235,74 +235,38 @@ class NuPlanDataSetT5(torch.utils.data.Dataset):
         agent = self.agent[index]
 
         ego_x = ego[:50,]
-        ego_y = ego[50:-1,]
+        ego_y = ego[50:,]
         agent_x = agent[:50,]
-        agent_y = agent[50:-1,]
+        agent_y = agent[50:,]
 
         return {'feature': (ego_x.float(), agent_x.float()), 'target': (ego_y.float(), agent_y.float())}
 
 
 class NuPlanDataSetGPT(torch.utils.data.Dataset):
 
-    def __init__(self, data, args):
-        self.len = data.num_rows
-        self.data = data
-        self.args = args
+    def __init__(self, data: Dict):
+
+        self.ego = []
+        self.agent = []
+        for k, s in data.items():
+            if k == 'ego':
+                for v in s:
+                    self.ego.extend(v)
+            elif k == 'agent':
+                for v in s:
+                    self.agent.extend(v)
+        self.len = len(self.ego)
 
     def __len__(self):
         return self.len
 
     def __getitem__(self, index):
-        item = self.data[index]
+        ego = self.ego[index]
+        agent = self.agent[index]
 
-        ego = item['ego']
-        agents = item['agents']
-        if agents.shape[1] >= self.args.num_of_agents:
-            agents = agents[:, :self.args.num_of_agents, ...]
-        else:
-            diff = self.args.num_of_agents - agents.shape[1]
-            padd = torch.zeros([agents.shape[0], diff, agents.shape[-1]])
-            agents = torch.cat([agents, padd], dim=1)
+        ego_x = ego[:-1,]
+        ego_y = ego[1:,]
+        agent_x = agent[:-1,]
+        agent_y = agent[1:,]
 
-        lanes = item['lanes']
-        lane_arrtib_fix = []
-        lane_path_fix = []
-        for frame in lanes:
-            lane_arrtibs = []
-            lane_paths = []
-            for l in frame:
-                lane_arrtib = l['lane_atttrib']
-                lane_path = l['path']
-                lane_arrtibs.append(lane_arrtib)
-                lane_paths.append(lane_path)
-            lane_path = torch.stack(lane_paths)
-            lane_arrtib = torch.stack(lane_arrtibs)
-            if lane_path.shape[0] >= self.args.num_of_lanes:
-                lane_path = lane_path[:self.args.num_of_lanes, ...]
-                lane_arrtib = lane_arrtib[:self.args.num_of_lanes, ...]
-            else:
-                diff = self.args.num_of_lanes - lane_path.shape[0]
-                lane_path_padd = torch.zeros(
-                    [diff, lane_path.shape[1], lane_path.shape[-1]])
-                lane_arrtib_padd = torch.zeros([diff, lane_arrtib.shape[1]])
-                lane_path = torch.cat([lane_path, lane_path_padd], dim=0)
-                lane_arrtib = torch.cat([lane_arrtib, lane_arrtib_padd], dim=0)
-            lane_arrtib_fix.append(lane_arrtib)
-            lane_path_fix.append(lane_path)
-
-        lane_path = torch.stack(lane_path_fix)
-        lane_arrtib = torch.stack(lane_arrtib_fix)
-        if lane_path.shape[0] != self.args.max_length + 1:
-            diff = self.args.max_length + 1 - lane_path.shape[0]
-            pdd = torch.zeros(
-                [diff, lane_path.shape[1],  lane_path.shape[2], lane_path.shape[3]])
-            lane_path = torch.cat([pdd, lane_path], dim=0)
-            pddd = torch.zeros(
-                [diff, lane_arrtib.shape[1], lane_arrtib.shape[2]])
-            lane_arrtib = torch.cat([pddd, lane_arrtib], dim=0)
-
-        y_ego = ego[1:, ..., :-1]
-        y_agents = agents[1:, ...]
-        return {'ego': ego[:self.args.max_length, ..., :-1], 'agents': agents[:self.args.max_length, ...],
-                'lanes': (lane_path[:self.args.max_length, ...], lane_arrtib[:self.args.max_length, ...]),
-                'y_ego': y_ego, 'y_agents': y_agents}
+        return {'feature': (ego_x.float(), agent_x.float()), 'target': (ego_y.float(), agent_y.float())}

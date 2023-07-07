@@ -4,7 +4,7 @@ import torch
 import argparse
 from torch.utils.data.dataloader import DataLoader
 from dataset.nuplan import NuPlanDataSetGPT
-from models.trajectory.traj_gpt_v2 import TrajGPT
+from models.trajectory.traj_gpt import TrajGPT
 import datasets
 from accelerate import Accelerator
 from accelerate import Accelerator
@@ -15,7 +15,7 @@ from transformers import get_scheduler
 import math
 import os
 from pathlib import Path
-
+import torch.utils.data.IterableDataset
 logger = get_logger(__name__)
 
 
